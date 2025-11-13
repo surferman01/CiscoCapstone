@@ -3,13 +3,17 @@ Capstone Project for client James Turman @ Cisco
 
 # Getting Started
 
-Activate the venv in the app dir by doing
+cd app
+
+python3 -m venv .venv
+or
+python -m venv .venv
 
 source .venv/bin/activate
 or
 .venv\Scripts\activate
 
-Then launch within the app dir with
+pip install -r requirements.txt
 
 python3 main.py
 or
