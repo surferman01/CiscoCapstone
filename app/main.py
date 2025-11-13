@@ -133,8 +133,11 @@ class SplashPage(QtWidgets.QWidget):
         # Middle: Training Type + Train button
         middle = make_column("Training")
         self.combo = QtWidgets.QComboBox()
-        self.combo.addItems(["-- select --", "Wafer", "Package", "Board", "Other"])
+        self.combo.addItems(["-- select --", "CatBoost", "XGBoost"])
         self.combo.setMinimumHeight(36)
+
+        self.gpuCheck = QtWidgets.QCheckBox("Use GPU (if available)")
+        self.gpuCheck.setChecked(True)  # default on
 
         self.trainBtn = QtWidgets.QPushButton("Train")
         self.trainBtn.setMinimumHeight(44)
@@ -142,6 +145,7 @@ class SplashPage(QtWidgets.QWidget):
 
         middle.layout().addWidget(QtWidgets.QLabel("What Type"))
         middle.layout().addWidget(self.combo)
+        middle.layout().addWidget(self.gpuCheck)
         middle.layout().addSpacing(8)
         middle.layout().addWidget(self.trainBtn)
         middle.layout().addStretch(1)
@@ -186,6 +190,7 @@ class SplashPage(QtWidgets.QWidget):
         base = os.path.basename(path)
         self.selectedLabel.setText(f"Selected: {base}")
         self.trainBtn.setEnabled(True)
+        self._update_train_enabled()
 
     def _on_file_dropped(self, path: str):
         self._set_data_path(path)
@@ -200,6 +205,10 @@ class SplashPage(QtWidgets.QWidget):
         if path:
             self._set_data_path(path)
 
+    def _update_train_enabled(self):
+        valid_model = self.combo.currentText() in {"CatBoost", "XGBoost"}
+        self.trainBtn.setEnabled(bool(self.data_path) and valid_model)
+
     def _on_train_click(self):
         if not self.data_path:
             QtWidgets.QMessageBox.information(
@@ -208,20 +217,21 @@ class SplashPage(QtWidgets.QWidget):
                 "Choose a CSV/Parquet file (drag & drop or Browse Files…).",
             )
             return
-        cfg_text, ok = QtWidgets.QInputDialog.getMultiLineText(
-            self,
-            "Analysis Config (JSON)",
-            "Provide configuration JSON (or leave defaults):",
-            json.dumps({"use_gpu": True}, indent=2),
-        )
-        if not ok:
+
+        model_type = self.combo.currentText()
+        if model_type not in {"CatBoost", "XGBoost"}:
+            QtWidgets.QMessageBox.information(
+                self, "Choose model", "Please select CatBoost or XGBoost."
+            )
             return
-        try:
-            cfg = json.loads(cfg_text) if cfg_text.strip() else {}
-        except Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Invalid JSON", f"{e}")
-            return
-        self.requestTrain.emit(self.data_path, cfg)
+
+        config = {
+            "model_type": model_type,
+            "use_gpu": self.gpuCheck.isChecked(),
+            # You can expose more UI toggles later and add them here.
+        }
+
+        self.requestTrain.emit(self.data_path, config)
 
     def _on_load_trained_clicked(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
