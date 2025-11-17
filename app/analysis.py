@@ -46,7 +46,7 @@ def _train_catboost(X, y, cfg):
     test_pool = Pool(X_test, y_test)
 
     params = dict(
-        iterations=cfg.get("iterations", 500),
+        iterations=cfg.get("iterations", 500), # CHANGE TO ~50 FOR TESTING GUI CHANGES
         learning_rate=cfg.get("learning_rate", 0.05),
         depth=cfg.get("depth", 8),
         loss_function="MultiClass",
@@ -87,6 +87,42 @@ def _train_catboost(X, y, cfg):
         "importance", ascending=False
     )
 
+    # SHAP per-class importance with directional stats and normalized shares
+    shap_importance = {}
+    try:
+        shap_values = model.get_feature_importance(train_pool, type="ShapValues")
+        shap_arr = np.array(shap_values)
+        # Expected shape: (n_samples, n_classes, n_features + 1)
+        if shap_arr.ndim == 3:
+            class_labels = getattr(model, "classes_", None)
+            if class_labels is None:
+                class_labels = np.unique(y)
+            feature_values = shap_arr[:, :, :-1]
+            y_train_str = y_train.astype(str)
+            pass_mask = y_train_str.str.upper() == "PASS"
+            pass_means = X_train[pass_mask].mean(numeric_only=True)
+            pass_std = X_train[pass_mask].std(numeric_only=True)
+            for idx, cls in enumerate(class_labels):
+                if idx >= feature_values.shape[1]:
+                    break
+                cls_mask = y_train_str == str(cls)
+                cls_means = X_train[cls_mask].mean(numeric_only=True)
+                class_vals = feature_values[:, idx, :]
+                mean_abs = np.abs(class_vals).mean(axis=0)
+                mean_signed = class_vals.mean(axis=0)
+                total = mean_abs.sum()
+                df = pd.DataFrame({"feature": list(X.columns), "importance": mean_abs})
+                df["share_pct"] = np.where(total > 0, (df["importance"] / total) * 100, 0)
+                df["direction"] = mean_signed
+                df["failure_avg"] = df["feature"].map(cls_means.to_dict())
+                df["pass_avg"] = df["feature"].map(pass_means.to_dict())
+                df["pass_std"] = df["feature"].map(pass_std.to_dict())
+                df = df.sort_values("importance", ascending=False)
+                df["rank"] = np.arange(1, len(df) + 1)
+                shap_importance[str(cls)] = df
+    except Exception:
+        shap_importance = {}
+
     # ROC (one-vs-rest)
     roc = []
     classes = np.unique(y_test)
@@ -107,6 +143,7 @@ def _train_catboost(X, y, cfg):
         "confusion_matrix": cm,
         "classification_report": report,
         "feature_importance": fi,
+        "shap_importance": shap_importance,
         "roc": roc,
         "y_test": y_test,
         "y_pred": y_pred,
@@ -195,6 +232,44 @@ def _train_xgboost(X, y, cfg):
             {"feature": X.columns, "importance": model.feature_importances_}
         ).sort_values("importance", ascending=False)
 
+    shap_importance = {}
+    try:
+        import xgboost as xgb
+
+        dtrain = xgb.DMatrix(X_train, feature_names=list(X.columns))
+        shap_values = booster.predict(dtrain, pred_contribs=True)
+        shap_arr = np.array(shap_values)
+        # Expected shape: (n_samples, n_classes, n_features + 1)
+        if shap_arr.ndim == 3:
+            feature_values = shap_arr[:, :, :-1]
+            class_labels = getattr(model, "classes_", None)
+            if class_labels is None:
+                class_labels = np.unique(y)
+            y_train_str = y_train.astype(str)
+            pass_mask = y_train_str.str.upper() == "PASS"
+            pass_means = X_train[pass_mask].mean(numeric_only=True)
+            pass_std = X_train[pass_mask].std(numeric_only=True)
+            for idx, cls in enumerate(class_labels):
+                if idx >= feature_values.shape[1]:
+                    break
+                cls_mask = y_train_str == str(cls)
+                cls_means = X_train[cls_mask].mean(numeric_only=True)
+                class_vals = feature_values[:, idx, :]
+                mean_abs = np.abs(class_vals).mean(axis=0)
+                mean_signed = class_vals.mean(axis=0)
+                total = mean_abs.sum()
+                df = pd.DataFrame({"feature": list(X.columns), "importance": mean_abs})
+                df["share_pct"] = np.where(total > 0, (df["importance"] / total) * 100, 0)
+                df["direction"] = mean_signed
+                df["failure_avg"] = df["feature"].map(cls_means.to_dict())
+                df["pass_avg"] = df["feature"].map(pass_means.to_dict())
+                df["pass_std"] = df["feature"].map(pass_std.to_dict())
+                df = df.sort_values("importance", ascending=False)
+                df["rank"] = np.arange(1, len(df) + 1)
+                shap_importance[str(cls)] = df
+    except Exception:
+        shap_importance = {}
+
     # ROC (one-vs-rest)
     roc = []
     classes = np.unique(y_test)
@@ -220,6 +295,7 @@ def _train_xgboost(X, y, cfg):
         "confusion_matrix": cm,
         "classification_report": report,
         "feature_importance": fi,
+        "shap_importance": shap_importance,
         "roc": roc,
         "y_test": y_test,
         "y_pred": y_pred,
@@ -262,6 +338,7 @@ def run_analysis(data_path: str, config: dict) -> dict:
         },
         "metrics": res["metrics"],
         "feature_importance": res["feature_importance"],
+        "shap_importance": res.get("shap_importance", {}),
         "bins": bins,
         "roc": res["roc"],
         "confusion_matrix": res["confusion_matrix"],
