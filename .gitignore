@@ -1,3 +1,4 @@
 .vscode
 XGBoost
 .DS_Store
+catboost_info/

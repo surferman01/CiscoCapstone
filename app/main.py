@@ -327,8 +327,18 @@ class DashboardTabs(QtWidgets.QTabWidget):
 
         # --- Feature Importance
         fl = QtWidgets.QVBoxLayout(self.fiPage)
-        self.fiCard = ChartCard("Feature Importance (Top 30)")
-        fl.addWidget(self.fiCard)
+        self.fiHeader = QtWidgets.QLabel(
+            "Top 20 features by SHAP."
+        )
+        self.fiHeader.setWordWrap(True)
+        fl.addWidget(self.fiHeader)
+
+        self.fiTablesLayout = QtWidgets.QGridLayout()
+        self.fiTablesLayout.setHorizontalSpacing(12)
+        self.fiTablesLayout.setVerticalSpacing(12)
+        self.fiTablesLayout.setAlignment(Qt.AlignTop)
+        fl.addLayout(self.fiTablesLayout)
+        fl.addStretch(1)
 
         # --- Metrics
         ml = QtWidgets.QVBoxLayout(self.metricsPage)
@@ -398,6 +408,16 @@ class DashboardPage(QtWidgets.QWidget):
         actions.addWidget(self.saveBtn)
         root.addLayout(actions)
 
+    def _clear_layout(self, layout: QtWidgets.QLayout):
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            child_layout = item.layout()
+            if widget:
+                widget.deleteLater()
+            elif child_layout:
+                self._clear_layout(child_layout)
+
     def populate(self, results: dict):
         # KPIs
         self.tabs.clear_kpis()
@@ -432,16 +452,102 @@ class DashboardPage(QtWidgets.QWidget):
         self.tabs.ovRoc.canvas.figure.tight_layout()
         self.tabs.ovRoc.canvas.draw()
 
-        # Feature importance
-        fi = results.get("feature_importance", pd.DataFrame())
-        ax = self.tabs.fiCard.ax
-        ax.clear()
-        if isinstance(fi, pd.DataFrame) and not fi.empty:
-            top = fi.head(min(30, len(fi)))
-            ax.barh(list(top["feature"][::-1]), list(top["importance"][::-1]))
-            ax.set_xlabel("Importance")
-        self.tabs.fiCard.canvas.figure.tight_layout()
-        self.tabs.fiCard.canvas.draw()
+        # Feature importance tables (per class)
+        self._clear_layout(self.tabs.fiTablesLayout)
+        shap_importance = results.get("shap_importance", {})
+        failure_classes = ["cal_1", "cal_2", "other"]
+        normalized = {}
+        if isinstance(shap_importance, dict):
+            for key, df_val in shap_importance.items():
+                normalized[str(key).strip().lower()] = df_val
+
+        if normalized:
+            added = 0
+            for col_idx, cls in enumerate(failure_classes):
+                df = normalized.get(cls)
+                if not (isinstance(df, pd.DataFrame) and not df.empty):
+                    continue
+                group = QtWidgets.QGroupBox(f"{cls} – Top 20 Features")
+                group.setSizePolicy(
+                    QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding
+                )
+                vbox = QtWidgets.QVBoxLayout(group)
+                table = QtWidgets.QTableWidget()
+                table.setSizePolicy(
+                    QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding
+                )
+                table.setMinimumHeight(630)
+                table.setColumnCount(8)
+                table.setHorizontalHeaderLabels(
+                    [
+                        "Rank",
+                        "Feature",
+                        "SHAP |Δ|",
+                        "Share (%)",
+                        "Direction",
+                        "Failure Avg",
+                        "PASS Avg",
+                        "PASS Std",
+                    ]
+                )
+                table.verticalHeader().setVisible(False)
+                table.setTextElideMode(Qt.ElideNone)
+                table.setWordWrap(True)
+                header = table.horizontalHeader()
+                header.setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
+                header.setStretchLastSection(True)
+                table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+                table.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+                table.setAlternatingRowColors(True)
+                top = df.head(20)
+                table.setRowCount(len(top))
+                for idx, row in top.reset_index(drop=True).iterrows():
+                    table.setItem(
+                        idx, 0, QtWidgets.QTableWidgetItem(str(int(row["rank"])))
+                    )
+                    table.setItem(idx, 1, QtWidgets.QTableWidgetItem(str(row["feature"])))
+                    table.setItem(
+                        idx,
+                        2,
+                        QtWidgets.QTableWidgetItem(f"{float(row['importance']):.4f}"),
+                    )
+                    table.setItem(
+                        idx,
+                        3,
+                        QtWidgets.QTableWidgetItem(f"{float(row.get('share_pct', 0)):.1f}"),
+                    )
+                    table.setItem(
+                        idx,
+                        4,
+                        QtWidgets.QTableWidgetItem(f"{float(row.get('direction', 0)):.4f}"),
+                    )
+                    table.setItem(
+                        idx,
+                        5,
+                        QtWidgets.QTableWidgetItem(
+                            "" if pd.isna(row.get("failure_avg")) else f"{float(row.get('failure_avg')):.4f}"
+                        ),
+                    )
+                    pass_avg = row.get("pass_avg")
+                    pass_std = row.get("pass_std")
+                    pass_avg_text = "" if pd.isna(pass_avg) else f"{float(pass_avg):.4f}"
+                    pass_std_text = "" if pd.isna(pass_std) else f"{float(pass_std):.4f}"
+                    table.setItem(idx, 6, QtWidgets.QTableWidgetItem(pass_avg_text))
+                    table.setItem(idx, 7, QtWidgets.QTableWidgetItem(pass_std_text))
+                table.resizeColumnsToContents()
+                vbox.addWidget(table)
+                self.tabs.fiTablesLayout.addWidget(group, 0, col_idx)
+                self.tabs.fiTablesLayout.setColumnStretch(col_idx, 1)
+                added += 1
+
+            if added == 0:
+                msg = QtWidgets.QLabel("No SHAP-based feature importance available.")
+                msg.setStyleSheet("color:#666;")
+                self.tabs.fiTablesLayout.addWidget(msg, 0, 0)
+        else:
+            msg = QtWidgets.QLabel("No SHAP-based feature importance available.")
+            msg.setStyleSheet("color:#666;")
+            self.tabs.fiTablesLayout.addWidget(msg, 0, 0)
 
         # Metrics text (include classification report)
         report = results.get("artifacts", {}).get("log", "")
