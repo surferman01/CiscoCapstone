@@ -43,7 +43,7 @@ def _train_catboost(X, y, cfg):
     test_pool = Pool(X_test, y_test)
 
     params = dict(
-        iterations=cfg.get("iterations", 500) # CHANGE TO ~10 FOR TESTING GUI CHANGES
+        iterations=cfg.get("iterations", 500),  # CHANGE TO ~10 FOR TESTING GUI CHANGES
         learning_rate=cfg.get("learning_rate", 0.05),
         depth=cfg.get("depth", 8),
         loss_function="MultiClass",
@@ -100,7 +100,9 @@ def _train_catboost(X, y, cfg):
                 mean_signed = class_vals.mean(axis=0)
                 total = mean_abs.sum()
                 df = pd.DataFrame({"feature": list(X.columns), "importance": mean_abs})
-                df["share_pct"] = np.where(total > 0, (df["importance"] / total) * 100, 0)
+                df["share_pct"] = np.where(
+                    total > 0, (df["importance"] / total) * 100, 0
+                )
                 df["direction"] = mean_signed
                 df["failure_avg"] = df["feature"].map(cls_means.to_dict())
                 df["pass_avg"] = df["feature"].map(pass_means.to_dict())
@@ -226,7 +228,9 @@ def _train_xgboost(X, y, cfg):
                 mean_signed = class_vals.mean(axis=0)
                 total = mean_abs.sum()
                 df = pd.DataFrame({"feature": list(X.columns), "importance": mean_abs})
-                df["share_pct"] = np.where(total > 0, (df["importance"] / total) * 100, 0)
+                df["share_pct"] = np.where(
+                    total > 0, (df["importance"] / total) * 100, 0
+                )
                 df["direction"] = mean_signed
                 df["failure_avg"] = df["feature"].map(cls_means.to_dict())
                 df["pass_avg"] = df["feature"].map(pass_means.to_dict())
