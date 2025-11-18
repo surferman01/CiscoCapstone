@@ -3,9 +3,6 @@ import pandas as pd
 
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
-    accuracy_score,
-    f1_score,
-    confusion_matrix,
     classification_report,
     roc_curve,
     auc,
@@ -46,7 +43,7 @@ def _train_catboost(X, y, cfg):
     test_pool = Pool(X_test, y_test)
 
     params = dict(
-        iterations=cfg.get("iterations", 500), # CHANGE TO ~50 FOR TESTING GUI CHANGES
+        iterations=cfg.get("iterations", 500) # CHANGE TO ~10 FOR TESTING GUI CHANGES
         learning_rate=cfg.get("learning_rate", 0.05),
         depth=cfg.get("depth", 8),
         loss_function="MultiClass",
@@ -76,16 +73,7 @@ def _train_catboost(X, y, cfg):
     y_prob = model.predict_proba(X_test)
 
     # metrics
-    acc = accuracy_score(y_test, y_pred)
-    f1w = f1_score(y_test, y_pred, average="weighted")
-    cm = confusion_matrix(y_test, y_pred)
-    report = classification_report(y_test, y_pred)
-
-    # feature importance
-    fi_vals = model.get_feature_importance(train_pool, type="FeatureImportance")
-    fi = pd.DataFrame({"feature": list(X.columns), "importance": fi_vals}).sort_values(
-        "importance", ascending=False
-    )
+    report = classification_report(y_test, y_pred, output_dict=True, zero_division=0)
 
     # SHAP per-class importance with directional stats and normalized shares
     shap_importance = {}
@@ -139,10 +127,7 @@ def _train_catboost(X, y, cfg):
 
     return {
         "model_name": "CatBoostClassifier",
-        "metrics": {"Accuracy": float(acc), "F1_weighted": float(f1w)},
-        "confusion_matrix": cm,
         "classification_report": report,
-        "feature_importance": fi,
         "shap_importance": shap_importance,
         "roc": roc,
         "y_test": y_test,
@@ -212,25 +197,7 @@ def _train_xgboost(X, y, cfg):
         y_pred = np.array([classes_[i] for i in y_pred])
 
     # metrics
-    acc = accuracy_score(y_test, y_pred)
-    f1w = f1_score(y_test, y_pred, average="weighted")
-    cm = confusion_matrix(y_test, y_pred)
-    report = classification_report(y_test, y_pred)
-
-    # feature importance (gain if available, fallback to weight)
-    try:
-        booster = model.get_booster()
-        fmap = {f"f{i}": c for i, c in enumerate(X.columns)}
-        score = booster.get_score(importance_type="gain")
-        # map f# to column names
-        fi = pd.DataFrame(
-            [{"feature": fmap.get(k, k), "importance": v} for k, v in score.items()]
-        ).sort_values("importance", ascending=False)
-    except Exception:
-        # fallback to model.feature_importances_
-        fi = pd.DataFrame(
-            {"feature": X.columns, "importance": model.feature_importances_}
-        ).sort_values("importance", ascending=False)
+    report = classification_report(y_test, y_pred, output_dict=True, zero_division=0)
 
     shap_importance = {}
     try:
@@ -291,10 +258,7 @@ def _train_xgboost(X, y, cfg):
 
     return {
         "model_name": "XGBClassifier",
-        "metrics": {"Accuracy": float(acc), "F1_weighted": float(f1w)},
-        "confusion_matrix": cm,
         "classification_report": report,
-        "feature_importance": fi,
         "shap_importance": shap_importance,
         "roc": roc,
         "y_test": y_test,
@@ -318,8 +282,8 @@ def run_analysis(data_path: str, config: dict) -> dict:
     else:  # default to CatBoost
         res = _train_catboost(X, y, config or {})
 
-    # Build bins from test labels
-    bcounts = pd.Series(res["y_test"]).value_counts().sort_index()
+    # Build bins from the full label distribution (not just the test split)
+    bcounts = pd.Series(y).value_counts().sort_index()
     bins = pd.DataFrame(
         {"bin_name": bcounts.index.astype(str), "count": bcounts.values}
     )
@@ -336,12 +300,10 @@ def run_analysis(data_path: str, config: dict) -> dict:
             "cols": int(len(df.columns)),
             "model": res["model_name"],
         },
-        "metrics": res["metrics"],
-        "feature_importance": res["feature_importance"],
         "shap_importance": res.get("shap_importance", {}),
         "bins": bins,
         "roc": res["roc"],
-        "confusion_matrix": res["confusion_matrix"],
+        "classification_report": res["classification_report"],
         "artifacts": artifacts,
         "dataframe": df.head(200),  # for the preview table
     }
