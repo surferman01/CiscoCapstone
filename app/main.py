@@ -294,25 +294,51 @@ class DashboardTabs(QtWidgets.QTabWidget):
         self.overview = QtWidgets.QWidget()
         self.tablePage = QtWidgets.QWidget()
         self.fiPage = QtWidgets.QWidget()
-        self.metricsPage = QtWidgets.QWidget()
-        self.confPage = QtWidgets.QWidget()
-        self.rocPage = QtWidgets.QWidget()
-        self.binsPage = QtWidgets.QWidget()
 
         self.addTab(self.overview, "Overview")
         self.addTab(self.tablePage, "Data Table")
         self.addTab(self.fiPage, "Feature Importance")
-        self.addTab(self.metricsPage, "Metrics")
-        self.addTab(self.confPage, "Confusion Matrix")
-        self.addTab(self.rocPage, "ROC Curves")
-        self.addTab(self.binsPage, "Bins")
 
         # --- Overview layout
         ov = QtWidgets.QVBoxLayout(self.overview)
-        self.kpiRow = QtWidgets.QHBoxLayout()
-        ov.addLayout(self.kpiRow)
-        self.ovBar = ChartCard("Class Distribution (Test)")
-        self.ovRoc = ChartCard("ROC Curves (Preview)")
+        self.metricsGroup = QtWidgets.QGroupBox("Classification Report")
+        metricsLayout = QtWidgets.QVBoxLayout(self.metricsGroup)
+
+        self.reportTable = QtWidgets.QTableWidget(0, 5)
+        self.reportTable.setHorizontalHeaderLabels(
+            ["Class", "Precision", "Recall", "F1-Score", "Support"]
+        )
+        self.reportTable.horizontalHeader().setStretchLastSection(True)
+        self.reportTable.verticalHeader().setVisible(False)
+        self.reportTable.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.reportTable.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+        self.reportTable.setFocusPolicy(Qt.NoFocus)
+        metricsLayout.addWidget(self.reportTable)
+
+        self.summaryGrid = QtWidgets.QGridLayout()
+        self.summaryGrid.setVerticalSpacing(4)
+
+        self.accuracyLabel = QtWidgets.QLabel("Accuracy:")
+        self.accuracyValue = QtWidgets.QLabel("–")
+        self.summaryGrid.addWidget(self.accuracyLabel, 0, 0, alignment=Qt.AlignLeft)
+        self.summaryGrid.addWidget(self.accuracyValue, 0, 1, alignment=Qt.AlignRight)
+
+        self.macroLabel = QtWidgets.QLabel("Macro Avg:")
+        self.macroValues = QtWidgets.QLabel("–")
+        self.summaryGrid.addWidget(self.macroLabel, 1, 0, alignment=Qt.AlignLeft)
+        self.summaryGrid.addWidget(self.macroValues, 1, 1, alignment=Qt.AlignRight)
+
+        self.weightedLabel = QtWidgets.QLabel("Weighted Avg:")
+        self.weightedValues = QtWidgets.QLabel("–")
+        self.summaryGrid.addWidget(self.weightedLabel, 2, 0, alignment=Qt.AlignLeft)
+        self.summaryGrid.addWidget(self.weightedValues, 2, 1, alignment=Qt.AlignRight)
+
+        self.summaryGrid.setColumnStretch(0, 1)
+        self.summaryGrid.setColumnStretch(1, 1)
+        metricsLayout.addLayout(self.summaryGrid)
+        ov.addWidget(self.metricsGroup)
+        self.ovBar = ChartCard("Class Distribution")
+        self.ovRoc = ChartCard("ROC Curves")
         row = QtWidgets.QHBoxLayout()
         row.addWidget(self.ovBar, 1)
         row.addWidget(self.ovRoc, 1)
@@ -339,47 +365,6 @@ class DashboardTabs(QtWidgets.QTabWidget):
         self.fiTablesLayout.setAlignment(Qt.AlignTop)
         fl.addLayout(self.fiTablesLayout)
         fl.addStretch(1)
-
-        # --- Metrics
-        ml = QtWidgets.QVBoxLayout(self.metricsPage)
-        self.metricsText = QtWidgets.QPlainTextEdit()
-        self.metricsText.setReadOnly(True)
-        self.metricsText.setMinimumHeight(220)
-        ml.addWidget(self.metricsText)
-
-        # --- Confusion Matrix
-        cl = QtWidgets.QVBoxLayout(self.confPage)
-        self.confCard = ChartCard("Confusion Matrix")
-        cl.addWidget(self.confCard)
-
-        # --- ROC
-        rl = QtWidgets.QVBoxLayout(self.rocPage)
-        self.rocCard = ChartCard("ROC Curves")
-        rl.addWidget(self.rocCard)
-
-        # --- Bins
-        bl = QtWidgets.QVBoxLayout(self.binsPage)
-        self.binsCard = ChartCard("Bin Counts")
-        bl.addWidget(self.binsCard)
-
-    def clear_kpis(self):
-        while self.kpiRow.count():
-            item = self.kpiRow.takeAt(0)
-            w = item.widget()
-            if w:
-                w.deleteLater()
-
-    def add_kpi(self, name, value):
-        box = QtWidgets.QGroupBox(name)
-        v = QtWidgets.QVBoxLayout(box)
-        lab = QtWidgets.QLabel(str(value))
-        f = lab.font()
-        f.setPointSize(18)
-        f.setBold(True)
-        lab.setFont(f)
-        lab.setAlignment(Qt.AlignCenter)
-        v.addWidget(lab)
-        self.kpiRow.addWidget(box)
 
 
 class DashboardPage(QtWidgets.QWidget):
@@ -419,12 +404,6 @@ class DashboardPage(QtWidgets.QWidget):
                 self._clear_layout(child_layout)
 
     def populate(self, results: dict):
-        # KPIs
-        self.tabs.clear_kpis()
-        for k in ["Accuracy", "F1_weighted"]:
-            if k in results.get("metrics", {}):
-                self.tabs.add_kpi(k, f"{results['metrics'][k]:.4f}")
-
         # Table
         df = results.get("dataframe", pd.DataFrame())
         self.tabs.table.setModel(PandasModel(df))
@@ -440,10 +419,10 @@ class DashboardPage(QtWidgets.QWidget):
         self.tabs.ovBar.canvas.figure.tight_layout()
         self.tabs.ovBar.canvas.draw()
 
-        # Overview ROC preview (first few)
+        # Overview ROC preview
         ax = self.tabs.ovRoc.ax
         ax.clear()
-        for r in results.get("roc", [])[:3]:
+        for r in results.get("roc", []):
             ax.plot(r["fpr"], r["tpr"], label=f"{r['class']} (AUC={r['auc']:.3f})")
         ax.plot([0, 1], [0, 1], "--", linewidth=1)
         ax.set_xlabel("FPR")
@@ -549,46 +528,96 @@ class DashboardPage(QtWidgets.QWidget):
             msg.setStyleSheet("color:#666;")
             self.tabs.fiTablesLayout.addWidget(msg, 0, 0)
 
-        # Metrics text (include classification report)
-        report = results.get("artifacts", {}).get("log", "")
-        metrics_lines = [f"{k}: {v:.4f}" for k, v in results.get("metrics", {}).items()]
-        self.tabs.metricsText.setPlainText("\n".join(metrics_lines) + "\n\n" + report)
+        # Overview classification report
+        report = results.get("classification_report", {})
+        report_table = self.tabs.reportTable
+        report_table.setRowCount(0)
+        self.tabs.accuracyValue.setText("–")
+        self.tabs.macroValues.setText("–")
+        self.tabs.weightedValues.setText("–")
+        if isinstance(report, dict) and report:
+            class_rows = [
+                (label, stats)
+                for label, stats in report.items()
+                if label not in {"accuracy", "macro avg", "weighted avg"}
+            ]
+            for row_idx, (label, stats) in enumerate(class_rows):
+                report_table.insertRow(row_idx)
+                cls_item = QtWidgets.QTableWidgetItem(str(label))
+                cls_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                report_table.setItem(row_idx, 0, cls_item)
 
-        # Confusion matrix
-        ax = self.tabs.confCard.ax
-        ax.clear()
-        cm = results.get("confusion_matrix", None)
-        if cm is not None:
-            im = ax.imshow(cm, cmap="Blues")
-            ax.figure.colorbar(im, ax=ax)
-            ax.set_title("Confusion Matrix")
-            ax.set_xlabel("Predicted")
-            ax.set_ylabel("True")
-        self.tabs.confCard.canvas.figure.tight_layout()
-        self.tabs.confCard.canvas.draw()
+                if isinstance(stats, dict):
+                    values = [
+                        stats.get("precision", 0.0),
+                        stats.get("recall", 0.0),
+                        stats.get("f1-score", 0.0),
+                        stats.get("support", 0),
+                    ]
 
-        # ROC page
-        ax = self.tabs.rocCard.ax
-        ax.clear()
-        for r in results.get("roc", []):
-            ax.plot(r["fpr"], r["tpr"], label=f"{r['class']} (AUC={r['auc']:.3f})")
-        ax.plot([0, 1], [0, 1], "--", linewidth=1)
-        ax.set_xlabel("FPR")
-        ax.set_ylabel("TPR")
-        ax.legend()
-        self.tabs.rocCard.canvas.figure.tight_layout()
-        self.tabs.rocCard.canvas.draw()
+                for col_idx, val in enumerate(values, start=1):
+                    if col_idx < 4:
+                        text = f"{float(val):.4f}" if val != "" else ""
+                    else:
+                        text = f"{int(val)}" if isinstance(val, (int, float)) else ""
+                    item = QtWidgets.QTableWidgetItem(text)
+                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                    item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                    report_table.setItem(row_idx, col_idx, item)
 
-        # Bins page
-        ax = self.tabs.binsCard.ax
-        ax.clear()
-        if isinstance(bins, pd.DataFrame) and not bins.empty:
-            ax.bar(bins["bin_name"].astype(str), bins["count"])
-            ax.set_xlabel("Class")
-            ax.set_ylabel("Count")
-        self.tabs.binsCard.canvas.figure.tight_layout()
-        self.tabs.binsCard.canvas.draw()
+            accuracy = report.get("accuracy")
+            if accuracy is not None:
+                self.tabs.accuracyValue.setText(f"{float(accuracy):.4f}")
 
+            macro = report.get("macro avg") or {}
+            if isinstance(macro, dict):
+                macro_parts = [
+                    macro.get("precision"),
+                    macro.get("recall"),
+                    macro.get("f1-score"),
+                    macro.get("support"),
+                ]
+                macro_text = ", ".join(
+                    [
+                        part
+                        for part in [
+                            f"P {macro_parts[0]:.4f}" if macro_parts[0] is not None else "",
+                            f"R {macro_parts[1]:.4f}" if macro_parts[1] is not None else "",
+                            f"F1 {macro_parts[2]:.4f}" if macro_parts[2] is not None else "",
+                            f"N {int(macro_parts[3])}" if macro_parts[3] is not None else "",
+                        ]
+                        if part
+                    ]
+                )
+                self.tabs.macroValues.setText(macro_text or "–")
+
+            weighted = report.get("weighted avg") or {}
+            if isinstance(weighted, dict):
+                weighted_parts = [
+                    weighted.get("precision"),
+                    weighted.get("recall"),
+                    weighted.get("f1-score"),
+                    weighted.get("support"),
+                ]
+                weighted_text = ", ".join(
+                    [
+                        part
+                        for part in [
+                            f"P {weighted_parts[0]:.4f}" if weighted_parts[0] is not None else "",
+                            f"R {weighted_parts[1]:.4f}" if weighted_parts[1] is not None else "",
+                            f"F1 {weighted_parts[2]:.4f}" if weighted_parts[2] is not None else "",
+                            f"N {int(weighted_parts[3])}" if weighted_parts[3] is not None else "",
+                        ]
+                        if part
+                    ]
+                )
+                self.tabs.weightedValues.setText(weighted_text or "–")
+        else:
+            report_table.setRowCount(1)
+            placeholder = QtWidgets.QTableWidgetItem("Classification report unavailable.")
+            placeholder.setFlags(Qt.ItemIsEnabled)
+            report_table.setItem(0, 0, placeholder)
+            report_table.setSpan(0, 0, 1, 5)
 
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
