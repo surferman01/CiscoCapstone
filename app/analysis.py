@@ -1,313 +1,579 @@
+# analysis.py
 import numpy as np
 import pandas as pd
 
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
+    accuracy_score,
+    f1_score,
+    confusion_matrix,
     classification_report,
     roc_curve,
     auc,
 )
+from sklearn.preprocessing import LabelEncoder
+from sklearn.preprocessing import label_binarize
 
-# --- Optional backends; we import inside helpers to make tooling friendlier ----
+
+# -------------------------
+# Data loading
+# -------------------------
+def _load_df(path: str) -> pd.DataFrame:
+    p = path.lower()
+    if p.endswith(".csv"):
+        return pd.read_csv(path)
+    if p.endswith(".parquet") or p.endswith(".pq"):
+        return pd.read_parquet(path)
+    raise ValueError(f"Unsupported file type: {path}")
 
 
-def _prepare_xy(df: pd.DataFrame):
+# -------------------------
+# Mild column dropping (SAFE)
+# -------------------------
+def _drop_obvious_id_columns(df: pd.DataFrame, target_col: str) -> pd.DataFrame:
     """
-    Expect: id, test_bin, optional test_result, plus feature columns.
-    Returns X, y after dropping id/test_result and filling NaNs numerically.
+    MUCH safer than the previous aggressive dropping.
+
+    Drops only:
+    - common ID-like names (id/serial/uuid/etc.)
+    - columns that are all-unique (one unique per row) => leakage/memorization
+    Keeps everything else (including categoricals).
     """
-    df = df.copy()
-    if "test_result" in df.columns:
-        df = df.drop(columns=["test_result"])
+    n = len(df)
+    drop = set()
 
-    y = df["test_bin"]
-    X = df.drop(columns=[c for c in ["id", "test_bin"] if c in df.columns])
+    name_hints = ("id", "serial", "sn", "uuid", "guid", "barcode", "ticket", "hash")
+    exact_drop = {"index", "row_id"}
 
-    # numeric-only median fill (prevents XGB/CatBoost from choking on NaNs)
-    X = X.fillna(X.median(numeric_only=True))
+    for c in df.columns:
+        if c == target_col:
+            continue
+
+        cl = c.strip().lower()
+
+        # exact matches
+        if cl in exact_drop:
+            drop.add(c)
+            continue
+
+        # name-based
+        if any(h in cl for h in name_hints) or cl.endswith("_id") or cl.endswith("id"):
+            drop.add(c)
+            continue
+
+        # all-unique => strong identifier signal
+        try:
+            nunique = df[c].nunique(dropna=True)
+            if n > 0 and nunique >= 0.98 * n:
+                drop.add(c)
+        except Exception:
+            # if nunique fails, do not drop
+            pass
+
+    if drop:
+        return df.drop(columns=[c for c in drop if c in df.columns])
+    return df
+
+
+# -------------------------
+# Feature prep
+# -------------------------
+def _split_features(df: pd.DataFrame, target_col: str):
+    if target_col not in df.columns:
+        raise ValueError(f"Target column '{target_col}' not found in dataset.")
+
+    y = df[target_col]
+    X = df.drop(columns=[target_col])
+
     return X, y
 
 
-def _train_catboost(X, y, cfg):
+def _fill_missing_for_catboost(X: pd.DataFrame) -> pd.DataFrame:
+    X = X.copy()
+    # numeric median
+    num_cols = X.select_dtypes(include=[np.number]).columns
+    if len(num_cols):
+        X[num_cols] = X[num_cols].fillna(X[num_cols].median(numeric_only=True))
+
+    # categoricals: fill NA with string token
+    cat_cols = [c for c in X.columns if c not in num_cols]
+    for c in cat_cols:
+        X[c] = X[c].astype("object").where(~X[c].isna(), "NA")
+    return X
+
+
+def _prep_for_xgboost(X: pd.DataFrame) -> pd.DataFrame:
+    """
+    XGBoost expects numeric features. We'll one-hot encode categoricals,
+    then force the final matrix to be pure numeric float.
+    """
+    X = X.copy()
+
+    # Separate numeric vs categorical-ish
+    num_cols = X.select_dtypes(include=[np.number]).columns
+    cat_cols = [c for c in X.columns if c not in num_cols]
+
+    # Fill numeric NaNs with median
+    if len(num_cols):
+        X[num_cols] = X[num_cols].fillna(X[num_cols].median(numeric_only=True))
+
+    # Coerce categoricals to strings, fill NaNs
+    for c in cat_cols:
+        X[c] = X[c].astype("object").where(~X[c].isna(), "NA").astype(str)
+
+    # One-hot encode categoricals
+    X_oh = pd.get_dummies(X, columns=cat_cols, drop_first=False)
+
+    # ✅ CRITICAL: force everything to numeric float
+    # Any non-numeric garbage becomes NaN, then we fill with 0.
+    X_oh = X_oh.apply(pd.to_numeric, errors="coerce").fillna(0.0)
+
+    # Ensure consistent dtype
+    return X_oh.astype(np.float32)
+
+
+
+# -------------------------
+# Per-class SHAP-like tables
+# -------------------------
+def _build_per_class_importance_tables(
+    X_num: pd.DataFrame,
+    y_true_labels,
+    shap_values,
+    class_names,
+):
+    """
+    Returns dict[class_lower] -> DataFrame with columns:
+    rank, feature, importance, share_pct, direction, failure_avg, pass_avg, pass_std
+    """
+    X_vals = X_num.to_numpy(dtype=np.float64, copy=False)
+    feats = list(X_num.columns)
+    y_series = pd.Series(y_true_labels).astype(str)
+
+    sv = np.asarray(shap_values)
+
+    # Normalize to (N, K, F+1)
+    if sv.ndim == 2:
+        # binary single-output style => treat as K=1
+        sv = sv[:, None, :]
+    elif sv.ndim == 3:
+        pass
+    else:
+        raise ValueError(f"Unexpected SHAP values shape: {sv.shape}")
+
+    N, K, Fp1 = sv.shape
+    F = Fp1 - 1  # ignore bias term
+
+    class_names = [str(c) for c in class_names]
+    out = {}
+
+    # If K==1 but we have 2 classes, build two tables (positive and negative)
+    if K == 1 and len(class_names) == 2:
+        sv_pos = sv[:, 0, :F]
+        sv_neg = -sv_pos
+        per_class = {class_names[1]: sv_pos, class_names[0]: sv_neg}
+    else:
+        per_class = {
+            class_names[i]: sv[:, i, :F] for i in range(min(K, len(class_names)))
+        }
+
+    for cls_name, sv_cls in per_class.items():
+        imp = np.mean(np.abs(sv_cls), axis=0)
+        total = float(np.sum(imp)) if np.sum(imp) > 0 else 1.0
+        share = (imp / total) * 100.0
+        direction = np.mean(sv_cls, axis=0)
+
+        mask = (y_series == str(cls_name)).values
+        if mask.sum() == 0:
+            fail_avg = np.full(F, np.nan)
+            other_avg = np.full(F, np.nan)
+            other_std = np.full(F, np.nan)
+        else:
+            fail_avg = np.nanmean(X_vals[mask, :], axis=0)
+            other_avg = (
+                np.nanmean(X_vals[~mask, :], axis=0)
+                if (~mask).sum()
+                else np.full(F, np.nan)
+            )
+            other_std = (
+                np.nanstd(X_vals[~mask, :], axis=0)
+                if (~mask).sum()
+                else np.full(F, np.nan)
+            )
+
+        df = (
+            pd.DataFrame(
+                {
+                    "feature": feats,
+                    "importance": imp,
+                    "share_pct": share,
+                    "direction": direction,
+                    "failure_avg": fail_avg,
+                    "pass_avg": other_avg,
+                    "pass_std": other_std,
+                }
+            )
+            .sort_values("importance", ascending=False)
+            .reset_index(drop=True)
+        )
+
+        df.insert(0, "rank", np.arange(1, len(df) + 1))
+        out[str(cls_name).strip().lower()] = df
+
+    return out
+
+
+# -------------------------
+# ROC helper
+# -------------------------
+def _compute_roc(y_true_labels, y_prob, class_names):
+    """
+    Returns list[{class,fpr,tpr,auc}] (one-vs-rest for multiclass).
+    """
+    class_names = [str(c) for c in class_names]
+    y_true = pd.Series(y_true_labels).astype(str)
+
+    roc_list = []
+    if len(class_names) == 2:
+        # For binary: compute both classes curves (symmetry), but we can provide both like your GUI shows
+        for i, cls in enumerate(class_names):
+            y_bin = (y_true == cls).astype(int).values
+            try:
+                fpr, tpr, _ = roc_curve(y_bin, y_prob[:, i])
+                roc_list.append(
+                    {"class": cls, "fpr": fpr, "tpr": tpr, "auc": auc(fpr, tpr)}
+                )
+            except Exception:
+                pass
+        return roc_list
+
+    # multiclass OVR
+    Y = label_binarize(y_true, classes=class_names)
+    for i, cls in enumerate(class_names):
+        try:
+            fpr, tpr, _ = roc_curve(Y[:, i], y_prob[:, i])
+            roc_list.append(
+                {"class": cls, "fpr": fpr, "tpr": tpr, "auc": auc(fpr, tpr)}
+            )
+        except Exception:
+            pass
+    return roc_list
+
+
+# -------------------------
+# Train: CatBoost
+# -------------------------
+def _train_catboost(X: pd.DataFrame, y: pd.Series, cfg: dict):
     from catboost import CatBoostClassifier, Pool
 
+    X_cb = _fill_missing_for_catboost(X)
+
+    # Identify categorical feature indices for CatBoost
+    num_cols = X_cb.select_dtypes(include=[np.number]).columns
+    cat_cols = [c for c in X_cb.columns if c not in num_cols]
+    cat_idx = [X_cb.columns.get_loc(c) for c in cat_cols]
+
+    y_series = pd.Series(y)
+    y_nonnull = y_series.dropna().astype(str)
+
+    classes = [str(c) for c in pd.unique(y_nonnull)]
+    num_classes = len(classes)
+    if num_classes < 2:
+        raise ValueError(
+            "Target must have at least 2 unique values (after dropping NaNs)."
+        )
+
     X_train, X_test, y_train, y_test = train_test_split(
-        X,
-        y,
+        X_cb,
+        y_series.astype(str),
         test_size=cfg.get("test_size", 0.2),
         random_state=cfg.get("random_state", 67),
-        stratify=y,
+        stratify=y_series.astype(str),
     )
 
-    train_pool = Pool(X_train, y_train)
-    test_pool = Pool(X_test, y_test)
+    train_pool = Pool(X_train, y_train, cat_features=cat_idx if cat_idx else None)
+    test_pool = Pool(X_test, y_test, cat_features=cat_idx if cat_idx else None)
+
+    use_gpu = bool(cfg.get("use_gpu", True))
+    loss = "Logloss" if num_classes == 2 else "MultiClass"
 
     params = dict(
-        iterations=cfg.get("iterations", 500),  # CHANGE TO ~10 FOR TESTING GUI CHANGES
-        learning_rate=cfg.get("learning_rate", 0.05),
-        depth=cfg.get("depth", 8),
-        loss_function="MultiClass",
+        iterations=int(cfg.get("iterations", 500)),
+        learning_rate=float(cfg.get("learning_rate", 0.05)),
+        depth=int(cfg.get("depth", 8)),
+        loss_function=loss,
         eval_metric="Accuracy",
-        random_seed=cfg.get("random_state", 67),
-        verbose=cfg.get("verbose", 100),
+        random_seed=int(cfg.get("random_state", 67)),
+        verbose=int(cfg.get("verbose", 100)),
     )
 
-    # Try GPU first if requested, fall back to CPU
-    use_gpu = cfg.get("use_gpu", True)
     if use_gpu:
         params.update({"task_type": "GPU"})
-        if "devices" in cfg:
-            params["devices"] = cfg["devices"]
+        # optional: cfg["devices"] if you want
 
+    # train (fallback to CPU automatically if GPU fails)
     try:
         model = CatBoostClassifier(**params)
         model.fit(train_pool, eval_set=test_pool, use_best_model=True)
     except Exception:
         params.pop("task_type", None)
-        params.pop("devices", None)
         model = CatBoostClassifier(**params)
         model.fit(train_pool, eval_set=test_pool, use_best_model=True)
 
-    # predictions
-    y_pred = model.predict(X_test).flatten()
+    y_pred = model.predict(X_test).flatten().astype(str)
     y_prob = model.predict_proba(X_test)
 
-    # metrics
-    report = classification_report(y_test, y_pred, output_dict=True, zero_division=0)
+    acc = accuracy_score(y_test, y_pred)
+    f1w = f1_score(y_test, y_pred, average="weighted")
+    cm = confusion_matrix(y_test, y_pred, labels=[str(c) for c in model.classes_])
+    report_text = classification_report(y_test, y_pred)
 
-    # SHAP per-class importance with directional stats and normalized shares
-    shap_importance = {}
-    try:
-        shap_values = model.get_feature_importance(train_pool, type="ShapValues")
-        shap_arr = np.array(shap_values)
-        # Expected shape: (n_samples, n_classes, n_features + 1)
-        if shap_arr.ndim == 3:
-            class_labels = getattr(model, "classes_", None)
-            if class_labels is None:
-                class_labels = np.unique(y)
-            feature_values = shap_arr[:, :, :-1]
-            y_train_str = y_train.astype(str)
-            pass_mask = y_train_str.str.upper() == "PASS"
-            pass_means = X_train[pass_mask].mean(numeric_only=True)
-            pass_std = X_train[pass_mask].std(numeric_only=True)
-            for idx, cls in enumerate(class_labels):
-                if idx >= feature_values.shape[1]:
-                    break
-                cls_mask = y_train_str == str(cls)
-                cls_means = X_train[cls_mask].mean(numeric_only=True)
-                class_vals = feature_values[:, idx, :]
-                mean_abs = np.abs(class_vals).mean(axis=0)
-                mean_signed = class_vals.mean(axis=0)
-                total = mean_abs.sum()
-                df = pd.DataFrame({"feature": list(X.columns), "importance": mean_abs})
-                df["share_pct"] = np.where(
-                    total > 0, (df["importance"] / total) * 100, 0
-                )
-                df["direction"] = mean_signed
-                df["failure_avg"] = df["feature"].map(cls_means.to_dict())
-                df["pass_avg"] = df["feature"].map(pass_means.to_dict())
-                df["pass_std"] = df["feature"].map(pass_std.to_dict())
-                df = df.sort_values("importance", ascending=False)
-                df["rank"] = np.arange(1, len(df) + 1)
-                shap_importance[str(cls)] = df
-    except Exception:
-        shap_importance = {}
+    # bins (use model.classes_ order)
+    bin_names = [str(c) for c in model.classes_]
+    counts = pd.Series(y_test).value_counts().reindex(bin_names).fillna(0).astype(int)
+    bins_df = pd.DataFrame({"bin_name": bin_names, "count": counts.values})
 
-    # ROC (one-vs-rest)
-    roc = []
-    classes = np.unique(y_test)
-    for i, cls in enumerate(classes):
-        try:
-            y_true = (y_test == cls).astype(int)
-            y_score = y_prob[:, i]
-            fpr, tpr, _ = roc_curve(y_true, y_score)
-            roc.append(
-                {"class": str(cls), "fpr": fpr, "tpr": tpr, "auc": auc(fpr, tpr)}
-            )
-        except Exception:
-            pass
+    # global feature importance
+    fi_vals = model.get_feature_importance(train_pool, type="FeatureImportance")
+    fi_df = pd.DataFrame(
+        {"feature": list(X_cb.columns), "importance": fi_vals}
+    ).sort_values("importance", ascending=False)
+
+    # ROC
+    roc_list = _compute_roc(y_test, y_prob, bin_names)
+
+    # per-class SHAP-style importance tables
+    shap_vals = model.get_feature_importance(
+        test_pool, type="ShapValues"
+    )  # (N,K,F+1) or (N,F+1)
+    shap_importance = _build_per_class_importance_tables(
+        X_train.reset_index(drop=True).astype(float, errors="ignore")
+        if False
+        else _prep_for_xgboost(X_test).reset_index(drop=True),
+        # NOTE: We want numeric matrix for averages; easiest is use xgboost-style numeric features:
+        # We'll instead compute on a numeric version of X_test:
+        # (This matches what the tables display; CatBoost SHAP is computed on original features.)
+        # Use a safe numeric encoding:
+        y_test.reset_index(drop=True),
+        shap_vals,
+        class_names=bin_names,
+    )
 
     return {
         "model_name": "CatBoostClassifier",
-        "classification_report": report,
+        "metrics": {"Accuracy": float(acc), "F1_weighted": float(f1w)},
+        "confusion_matrix": cm,
+        "classification_report": report_text,
+        "feature_importance": fi_df,
+        "roc": roc_list,
+        "bins": bins_df,
         "shap_importance": shap_importance,
-        "roc": roc,
-        "y_test": y_test,
-        "y_pred": y_pred,
+        "class_names": bin_names,
     }
 
 
-def _train_xgboost(X, y, cfg):
-    """
-    Multi-class XGBoost (softprob). Tries GPU first (gpu_hist/gpu_predictor), falls back to CPU.
-    """
+# -------------------------
+# Train: XGBoost
+# -------------------------
+def _train_xgboost(X: pd.DataFrame, y: pd.Series, cfg: dict):
+    import numpy as np
+    import xgboost as xgb
     from xgboost import XGBClassifier
+    from sklearn.preprocessing import LabelEncoder
+    from sklearn.model_selection import train_test_split
+    from sklearn.metrics import (
+        accuracy_score,
+        f1_score,
+        confusion_matrix,
+        classification_report,
+    )
+
+    # Encode target labels to ints for XGB
+    y_series = pd.Series(y).astype(str)
+    le = LabelEncoder()
+    y_enc = le.fit_transform(y_series)
+    class_names = [str(c) for c in le.classes_]
+    num_classes = len(class_names)
+    if num_classes < 2:
+        raise ValueError("Target must have at least 2 unique values.")
+
+    # One-hot encode categoricals
+    X_num = _prep_for_xgboost(X)
 
     X_train, X_test, y_train, y_test = train_test_split(
-        X,
-        y,
+        X_num,
+        y_enc,
         test_size=cfg.get("test_size", 0.2),
         random_state=cfg.get("random_state", 67),
-        stratify=y,
+        stratify=y_enc,
     )
 
-    params = dict(
-        n_estimators=cfg.get("n_estimators", 500),
-        learning_rate=cfg.get("learning_rate", 0.05),
-        max_depth=cfg.get("max_depth", 8),
-        subsample=cfg.get("subsample", 1.0),
-        colsample_bytree=cfg.get("colsample_bytree", 1.0),
-        objective="multi:softprob",
-        eval_metric="mlogloss",
-        random_state=cfg.get("random_state", 67),
-        n_jobs=cfg.get("n_jobs", 0),  # 0 lets XGB choose
-    )
+    use_gpu_requested = bool(cfg.get("use_gpu", True))
 
-    use_gpu = cfg.get("use_gpu", True)
-    if use_gpu:
-        params.update({"tree_method": "gpu_hist", "predictor": "gpu_predictor"})
+    # objective / eval metric
+    if num_classes == 2:
+        objective = "binary:logistic"
+        eval_metric = "logloss"
+        num_class_param = None
     else:
-        params.update({"tree_method": "hist"})
+        objective = "multi:softprob"
+        eval_metric = "mlogloss"
+        num_class_param = num_classes
 
-    try:
-        model = XGBClassifier(**params)
-        model.fit(
-            X_train,
-            y_train,
-            eval_set=[(X_test, y_test)],
-            verbose=cfg.get("verbose", 100) > 0,
-        )
-    except Exception:
-        # fallback to CPU if GPU isn’t available
-        params.update({"tree_method": "hist"})
-        params.pop("predictor", None)
-        model = XGBClassifier(**params)
-        model.fit(
-            X_train,
-            y_train,
-            eval_set=[(X_test, y_test)],
-            verbose=cfg.get("verbose", 100) > 0,
-        )
+    base_params = dict(
+        n_estimators=int(cfg.get("iterations", 500)),
+        learning_rate=float(cfg.get("learning_rate", 0.05)),
+        max_depth=int(cfg.get("depth", 8)),
+        subsample=float(cfg.get("subsample", 0.9)),
+        colsample_bytree=float(cfg.get("colsample_bytree", 0.9)),
+        objective=objective,
+        eval_metric=eval_metric,
+        random_state=int(cfg.get("random_state", 67)),
+        verbosity=int(cfg.get("verbosity", 1)),
+    )
+    if num_class_param is not None:
+        base_params["num_class"] = num_class_param
 
-    # predictions
-    y_prob = model.predict_proba(X_test)
-    y_pred = y_prob.argmax(axis=1)
+    # Try GPU if requested; otherwise CPU.
+    # NOTE: some xgboost builds don't support gpu_hist at all => fallback to hist.
+    if use_gpu_requested:
+        candidates = [
+            {"tree_method": "gpu_hist"},  # modern GPU
+            {"tree_method": "hist"},  # CPU fallback
+        ]
+    else:
+        candidates = [{"tree_method": "hist"}]
 
-    # If target labels aren’t 0..K-1, map back
-    classes_ = getattr(model, "classes_", None)
-    if classes_ is not None and not np.array_equal(classes_, np.arange(len(classes_))):
-        y_pred = np.array([classes_[i] for i in y_pred])
-
-    # metrics
-    report = classification_report(y_test, y_pred, output_dict=True, zero_division=0)
-
-    shap_importance = {}
-    try:
-        import xgboost as xgb
-
-        dtrain = xgb.DMatrix(X_train, feature_names=list(X.columns))
-        shap_values = booster.predict(dtrain, pred_contribs=True)
-        shap_arr = np.array(shap_values)
-        # Expected shape: (n_samples, n_classes, n_features + 1)
-        if shap_arr.ndim == 3:
-            feature_values = shap_arr[:, :, :-1]
-            class_labels = getattr(model, "classes_", None)
-            if class_labels is None:
-                class_labels = np.unique(y)
-            y_train_str = y_train.astype(str)
-            pass_mask = y_train_str.str.upper() == "PASS"
-            pass_means = X_train[pass_mask].mean(numeric_only=True)
-            pass_std = X_train[pass_mask].std(numeric_only=True)
-            for idx, cls in enumerate(class_labels):
-                if idx >= feature_values.shape[1]:
-                    break
-                cls_mask = y_train_str == str(cls)
-                cls_means = X_train[cls_mask].mean(numeric_only=True)
-                class_vals = feature_values[:, idx, :]
-                mean_abs = np.abs(class_vals).mean(axis=0)
-                mean_signed = class_vals.mean(axis=0)
-                total = mean_abs.sum()
-                df = pd.DataFrame({"feature": list(X.columns), "importance": mean_abs})
-                df["share_pct"] = np.where(
-                    total > 0, (df["importance"] / total) * 100, 0
-                )
-                df["direction"] = mean_signed
-                df["failure_avg"] = df["feature"].map(cls_means.to_dict())
-                df["pass_avg"] = df["feature"].map(pass_means.to_dict())
-                df["pass_std"] = df["feature"].map(pass_std.to_dict())
-                df = df.sort_values("importance", ascending=False)
-                df["rank"] = np.arange(1, len(df) + 1)
-                shap_importance[str(cls)] = df
-    except Exception:
-        shap_importance = {}
-
-    # ROC (one-vs-rest)
-    roc = []
-    classes = np.unique(y_test)
-    for i, cls in enumerate(classes):
+    last_err = None
+    model = None
+    for extra in candidates:
         try:
-            y_true = (y_test == cls).astype(int)
-            # find the proba column for this class
-            if classes_ is not None:
-                cls_index = int(np.where(classes_ == cls)[0][0])
-            else:
-                cls_index = i
-            y_score = y_prob[:, cls_index]
-            fpr, tpr, _ = roc_curve(y_true, y_score)
-            roc.append(
-                {"class": str(cls), "fpr": fpr, "tpr": tpr, "auc": auc(fpr, tpr)}
+            model = XGBClassifier(**base_params, **extra)
+            model.fit(
+                X_train,
+                y_train,
+                eval_set=[(X_test, y_test)],
+                verbose=bool(cfg.get("verbose", False)),
             )
-        except Exception:
-            pass
+            break
+        except Exception as e:
+            last_err = e
+            model = None
+            continue
+
+    if model is None:
+        raise RuntimeError(f"XGBoost training failed. Last error: {last_err}")
+
+    # Predictions
+    y_pred_enc = model.predict(X_test)
+    y_prob = model.predict_proba(X_test)
+
+    y_test_labels = le.inverse_transform(y_test)
+    y_pred_labels = le.inverse_transform(y_pred_enc)
+
+    acc = accuracy_score(y_test_labels, y_pred_labels)
+    f1w = f1_score(y_test_labels, y_pred_labels, average="weighted")
+    cm = confusion_matrix(y_test_labels, y_pred_labels, labels=class_names)
+    report_text = classification_report(y_test_labels, y_pred_labels)
+
+    # bins
+    counts = (
+        pd.Series(y_test_labels)
+        .value_counts()
+        .reindex(class_names)
+        .fillna(0)
+        .astype(int)
+    )
+    bins_df = pd.DataFrame({"bin_name": class_names, "count": counts.values})
+
+    # global feature importance
+    fi_df = pd.DataFrame(
+        {"feature": list(X_num.columns), "importance": model.feature_importances_}
+    ).sort_values("importance", ascending=False)
+
+    # ROC
+    roc_list = _compute_roc(y_test_labels, y_prob, class_names)
+
+    # SHAP-like contributions (built-in pred_contribs)
+    dtest = xgb.DMatrix(X_test, feature_names=list(X_num.columns))
+    contrib = model.get_booster().predict(dtest, pred_contribs=True)
+    contrib = np.asarray(contrib)
+
+    # Handle (N, K*(F+1)) flattened multiclass case
+    if (
+        contrib.ndim == 2
+        and num_classes > 2
+        and contrib.shape[1] == num_classes * (X_num.shape[1] + 1)
+    ):
+        contrib = contrib.reshape(contrib.shape[0], num_classes, X_num.shape[1] + 1)
+
+    shap_importance = _build_per_class_importance_tables(
+        X_test.reset_index(drop=True),
+        pd.Series(y_test_labels).reset_index(drop=True),
+        contrib,
+        class_names=class_names,
+    )
 
     return {
         "model_name": "XGBClassifier",
-        "classification_report": report,
+        "metrics": {"Accuracy": float(acc), "F1_weighted": float(f1w)},
+        "confusion_matrix": cm,
+        "classification_report": report_text,
+        "feature_importance": fi_df,
+        "roc": roc_list,
+        "bins": bins_df,
         "shap_importance": shap_importance,
-        "roc": roc,
-        "y_test": y_test,
-        "y_pred": y_pred,
+        "class_names": class_names,
     }
 
 
-def run_analysis(data_path: str, config: dict) -> dict:
-    # Load
-    if data_path.lower().endswith(".csv"):
-        df = pd.read_csv(data_path)
+# -------------------------
+# Public entrypoint
+# -------------------------
+def run_analysis(data_path: str, cfg: dict) -> dict:
+    model_type = (cfg.get("model_type") or "").strip()
+    target_col = (cfg.get("target_column") or "").strip()
+    if not target_col:
+        raise ValueError("No target_column provided in config.")
+
+    df = _load_df(data_path)
+
+    # SAFE mild drop only
+    df2 = _drop_obvious_id_columns(df, target_col)
+
+    X, y = _split_features(df2, target_col)
+
+    # Train
+    if model_type == "CatBoost":
+        trained = _train_catboost(X, y, cfg)
+    elif model_type == "XGBoost":
+        trained = _train_xgboost(X, y, cfg)
     else:
-        df = pd.read_parquet(data_path)
+        raise ValueError(
+            f"Unknown model_type '{model_type}'. Choose CatBoost or XGBoost."
+        )
 
-    X, y = _prepare_xy(df)
+    # Pack result in the format your GUI expects
+    preview_df = df2.head(300).copy()
 
-    model_type = (config or {}).get("model_type", "CatBoost")
-
-    if model_type == "XGBoost":
-        res = _train_xgboost(X, y, config or {})
-    else:  # default to CatBoost
-        res = _train_catboost(X, y, config or {})
-
-    # Build bins from the full label distribution (not just the test split)
-    bcounts = pd.Series(y).value_counts().sort_index()
-    bins = pd.DataFrame(
-        {"bin_name": bcounts.index.astype(str), "count": bcounts.values}
-    )
-    bins["rate"] = bins["count"] / bins["count"].sum()
+    meta = {
+        "model": trained["model_name"],
+        "target_column": target_col,
+        "num_classes": int(len(trained.get("class_names", []))),
+    }
 
     artifacts = {
-        "log": res["classification_report"],
-        "models": {},  # attach pickled model bytes here if desired
+        "log": trained.get("classification_report", ""),
     }
 
     return {
-        "meta": {
-            "rows": int(len(df)),
-            "cols": int(len(df.columns)),
-            "model": res["model_name"],
-        },
-        "shap_importance": res.get("shap_importance", {}),
-        "bins": bins,
-        "roc": res["roc"],
-        "classification_report": res["classification_report"],
+        "meta": meta,
+        "metrics": trained.get("metrics", {}),
+        "bins": trained.get("bins", pd.DataFrame()),
+        "roc": trained.get("roc", []),
+        "confusion_matrix": trained.get("confusion_matrix", None),
+        "feature_importance": trained.get("feature_importance", pd.DataFrame()),
+        "shap_importance": trained.get("shap_importance", {}),
         "artifacts": artifacts,
-        "dataframe": df.head(200),  # for the preview table
+        "dataframe": preview_df,
     }
