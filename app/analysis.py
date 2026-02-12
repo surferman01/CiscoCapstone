@@ -132,7 +132,6 @@ def _prep_for_xgboost(X: pd.DataFrame) -> pd.DataFrame:
     return X_oh.astype(np.float32)
 
 
-
 # -------------------------
 # Per-class SHAP-like tables
 # -------------------------
@@ -263,6 +262,22 @@ def _compute_roc(y_true_labels, y_prob, class_names):
 # -------------------------
 # Train: CatBoost
 # -------------------------
+
+
+def _apply_feature_excludes(
+    df: pd.DataFrame, target_col: str, exclude_cols
+) -> pd.DataFrame:
+    """
+    Drops exclude_cols from dataframe, but never drops the chosen target_col.
+    """
+    if not exclude_cols:
+        return df
+    drop = [c for c in exclude_cols if c in df.columns and c != target_col]
+    if drop:
+        return df.drop(columns=drop)
+    return df
+
+
 def _train_catboost(X: pd.DataFrame, y: pd.Series, cfg: dict):
     from catboost import CatBoostClassifier, Pool
 
@@ -540,6 +555,8 @@ def run_analysis(data_path: str, cfg: dict) -> dict:
 
     # SAFE mild drop only
     df2 = _drop_obvious_id_columns(df, target_col)
+
+    df2 = _apply_feature_excludes(df2, target_col, cfg.get("exclude_columns", []))
 
     X, y = _split_features(df2, target_col)
 

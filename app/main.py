@@ -200,6 +200,7 @@ class SplashPage(QtWidgets.QWidget):
         self.targetCombo.currentTextChanged.connect(self._update_train_enabled)
 
         self.trainBtn.clicked.connect(self._on_train_click)
+        self.recommended_targets = []
 
         self.data_path = None
         self._update_train_enabled()
@@ -239,6 +240,7 @@ class SplashPage(QtWidgets.QWidget):
                 df_preview = pd.read_parquet(path).head(5000)
 
             recs = self._recommend_targets(df_preview)
+            self.recommended_targets = recs[:]  # store for training-time excludes
 
             self.targetCombo.blockSignals(True)
             self.targetCombo.clear()
@@ -340,6 +342,9 @@ class SplashPage(QtWidgets.QWidget):
             "model_type": model_type,
             "use_gpu": self.gpuCheck.isChecked(),
             "target_column": target_col,
+            "exclude_columns": [
+                c for c in (self.recommended_targets or []) if c != target_col
+            ],
         }
         self.requestTrain.emit(self.data_path, config)
 
@@ -393,89 +398,45 @@ class TrainingPage(QtWidgets.QWidget):
 
 # ------------------------- Dashboard -------------------------
 class ChartCard(QtWidgets.QGroupBox):
-    def __init__(self, title: str):
+    def __init__(self, title: str, height: int = 380):
         super().__init__(title)
         self.setLayout(QtWidgets.QVBoxLayout())
+        self.layout().setContentsMargins(12, 12, 12, 12)
+        self.layout().setSpacing(8)
+
         self.canvas = FigureCanvas(Figure(figsize=(6, 3), dpi=100))
-        self.canvas.setFixedHeight(FIXED_CHART_HEIGHT)
+        self.canvas.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding
+        )
         self.ax = self.canvas.figure.add_subplot(111)
         self.layout().addWidget(self.canvas)
+
+        # ✅ fixed card height prevents “fill page” stretching
+        self.setMinimumHeight(height)
+        self.setMaximumHeight(height)
 
 
 class KPIBox(QtWidgets.QGroupBox):
     def __init__(self, title: str):
         super().__init__(title)
         self.setObjectName("kpiBox")
+
+        self.setMinimumHeight(110)
+        self.setMaximumHeight(130)
+
         v = QtWidgets.QVBoxLayout(self)
         v.setContentsMargins(12, 10, 12, 10)
+        v.setSpacing(6)
+
         self.value = QtWidgets.QLabel("—", alignment=Qt.AlignCenter)
         f = self.value.font()
-        f.setPointSize(14)
+        f.setPointSize(16)
         f.setBold(True)
         self.value.setFont(f)
-        v.addStretch(1)
+
+        v.addStretch(1)  # can change this to 2
         v.addWidget(self.value)
         v.addStretch(1)
-
-
-class DashboardTabs(QtWidgets.QTabWidget):
-    def __init__(self):
-        super().__init__()
-
-        self.dashboard = QtWidgets.QWidget()
-        self.tablePage = QtWidgets.QWidget()
-        self.fiPage = QtWidgets.QWidget()
-
-        self.addTab(self.dashboard, "Dashboard")
-        self.addTab(self.tablePage, "Data Table")
-        self.addTab(self.fiPage, "Feature Importance")
-
-        # ---------------- Dashboard tab ----------------
-        d = QtWidgets.QVBoxLayout(self.dashboard)
-
-        # KPI row like your screenshot
-        kpi_row = QtWidgets.QHBoxLayout()
-        self.kpiAccuracy = KPIBox("Accuracy")
-        self.kpiF1 = KPIBox("F1 (weighted)")
-        self.kpiModel = KPIBox("Model")
-        self.kpiTarget = KPIBox("Target")
-        self.kpiClasses = KPIBox("Classes")
-
-        kpi_row.addWidget(self.kpiAccuracy, 1)
-        kpi_row.addWidget(self.kpiF1, 1)
-        kpi_row.addWidget(self.kpiModel, 1)
-        kpi_row.addWidget(self.kpiTarget, 1)
-        kpi_row.addWidget(self.kpiClasses, 1)
-        d.addLayout(kpi_row)
-
-        self.ovBar = ChartCard("Class Distribution (Test)")
-        self.ovRoc = ChartCard("ROC Curves (Preview)")
-        row = QtWidgets.QHBoxLayout()
-        row.addWidget(self.ovBar, 1)
-        row.addWidget(self.ovRoc, 1)
-        d.addLayout(row)
-
-        # ---------------- Data Table tab ----------------
-        tl = QtWidgets.QVBoxLayout(self.tablePage)
-        self.table = QtWidgets.QTableView()
-        self.table.setSortingEnabled(True)
-        self.table.setAlternatingRowColors(True)
-        tl.addWidget(self.table)
-
-        # ---------------- Feature Importance tab ----------------
-        fl = QtWidgets.QVBoxLayout(self.fiPage)
-        self.fiHeader = QtWidgets.QLabel(
-            "Top 20 features by SHAP (one table per class/bin)."
-        )
-        self.fiHeader.setWordWrap(True)
-        fl.addWidget(self.fiHeader)
-
-        self.fiTablesLayout = QtWidgets.QGridLayout()
-        self.fiTablesLayout.setHorizontalSpacing(12)
-        self.fiTablesLayout.setVerticalSpacing(12)
-        self.fiTablesLayout.setAlignment(Qt.AlignTop)
-        fl.addLayout(self.fiTablesLayout)
-        fl.addStretch(1)
 
 
 class DashboardPage(QtWidgets.QWidget):
@@ -484,6 +445,7 @@ class DashboardPage(QtWidgets.QWidget):
 
     def __init__(self):
         super().__init__()
+
         root = QtWidgets.QVBoxLayout(self)
 
         title = QtWidgets.QLabel(
@@ -505,6 +467,112 @@ class DashboardPage(QtWidgets.QWidget):
         actions.addWidget(self.saveBtn)
         root.addLayout(actions)
 
+    def populate(self, results: dict):
+        self.tabs.populate(results)
+
+
+class DashboardTabs(QtWidgets.QTabWidget):
+    def __init__(self):
+        super().__init__()
+
+        # --- Tabs
+        self.dashboard = QtWidgets.QWidget()
+        self.tablePage = QtWidgets.QWidget()
+        self.fiPage = QtWidgets.QWidget()
+
+        self.addTab(self.dashboard, "Dashboard")
+        self.addTab(self.tablePage, "Data Table")
+        self.addTab(self.fiPage, "Feature Importance")
+
+        # =======================
+        # Dashboard tab (NO SCROLL)
+        # =======================
+        d = QtWidgets.QVBoxLayout(self.dashboard)
+        d.setContentsMargins(12, 12, 12, 12)
+        d.setSpacing(16)
+
+        # KPI row (fixed height)
+        kpi_row = QtWidgets.QHBoxLayout()
+        kpi_row.setSpacing(16)
+
+        self.kpiAccuracy = KPIBox("Accuracy")
+        self.kpiF1 = KPIBox("F1 (weighted)")
+        self.kpiModel = KPIBox("Model")
+        self.kpiTarget = KPIBox("Target")
+        self.kpiClasses = KPIBox("Classes")
+
+        kpi_row.addWidget(self.kpiAccuracy, 1)
+        kpi_row.addWidget(self.kpiF1, 1)
+        kpi_row.addWidget(self.kpiModel, 1)
+        kpi_row.addWidget(self.kpiTarget, 1)
+        kpi_row.addWidget(self.kpiClasses, 1)
+
+        kpi_wrap = QtWidgets.QWidget()
+        kpi_wrap.setLayout(kpi_row)
+        kpi_wrap.setMinimumHeight(130)
+        kpi_wrap.setMaximumHeight(140)
+        d.addWidget(kpi_wrap)
+
+        # Charts row (fixed height cards so nothing stretches)
+        self.ovBar = ChartCard("Class Distribution (Test)", height=380)
+        self.ovRoc = ChartCard("ROC Curves (Preview)", height=380)
+
+        charts_row = QtWidgets.QHBoxLayout()
+        charts_row.setSpacing(16)
+        charts_row.addWidget(self.ovBar, 1)
+        charts_row.addWidget(self.ovRoc, 1)
+
+        charts_wrap = QtWidgets.QWidget()
+        charts_wrap.setLayout(charts_row)
+        charts_wrap.setMinimumHeight(380)
+        charts_wrap.setMaximumHeight(380)
+        d.addWidget(charts_wrap)
+
+        d.addStretch(1)
+
+        # =======================
+        # Data Table tab
+        # =======================
+        tl = QtWidgets.QVBoxLayout(self.tablePage)
+        tl.setContentsMargins(12, 12, 12, 12)
+        self.table = QtWidgets.QTableView()
+        self.table.setSortingEnabled(True)
+        self.table.setAlternatingRowColors(True)
+        tl.addWidget(self.table)
+
+        # =======================
+        # Feature Importance tab (SCROLL)
+        # =======================
+        fi_outer = QtWidgets.QVBoxLayout(self.fiPage)
+        fi_outer.setContentsMargins(0, 0, 0, 0)
+
+        self.fiScroll = QtWidgets.QScrollArea()
+        self.fiScroll.setWidgetResizable(True)
+        self.fiScroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.fiScroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+
+        fi_outer.addWidget(self.fiScroll)
+
+        fi_inner = QtWidgets.QWidget()
+        self.fiScroll.setWidget(fi_inner)
+
+        fl = QtWidgets.QVBoxLayout(fi_inner)
+        fl.setContentsMargins(12, 12, 12, 12)
+        fl.setSpacing(12)
+
+        self.fiHeader = QtWidgets.QLabel("Top 20 features by SHAP.")
+        self.fiHeader.setWordWrap(True)
+        fl.addWidget(self.fiHeader)
+
+        self.fiTablesLayout = QtWidgets.QGridLayout()
+        self.fiTablesLayout.setHorizontalSpacing(12)
+        self.fiTablesLayout.setVerticalSpacing(12)
+        self.fiTablesLayout.setAlignment(Qt.AlignTop)
+        fl.addLayout(self.fiTablesLayout)
+
+        fl.addStretch(1)
+
+    # ------------ helpers ------------
     def _clear_layout(self, layout: QtWidgets.QLayout):
         while layout.count():
             item = layout.takeAt(0)
@@ -515,10 +583,11 @@ class DashboardPage(QtWidgets.QWidget):
             elif child_layout:
                 self._clear_layout(child_layout)
 
+    # ------------ public ------------
     def populate(self, results: dict):
         # Data table
         df = results.get("dataframe", pd.DataFrame())
-        self.tabs.table.setModel(PandasModel(df))
+        self.table.setModel(PandasModel(df))
 
         meta = results.get("meta", {}) or {}
         metrics = results.get("metrics", {}) or {}
@@ -526,22 +595,26 @@ class DashboardPage(QtWidgets.QWidget):
         roc_list = results.get("roc", [])
 
         # KPIs
-        if "Accuracy" in metrics:
-            self.tabs.kpiAccuracy.value.setText(f"{float(metrics['Accuracy']):.4f}")
-        else:
-            self.tabs.kpiAccuracy.value.setText("—")
+        self.kpiAccuracy.value.setText(
+            f"{float(metrics.get('Accuracy', 0.0)):.4f}"
+            if "Accuracy" in metrics
+            else "—"
+        )
+        self.kpiF1.value.setText(
+            f"{float(metrics.get('F1_weighted', 0.0)):.4f}"
+            if "F1_weighted" in metrics
+            else "—"
+        )
+        self.kpiModel.value.setText(str(meta.get("model", meta.get("model_name", "—"))))
+        self.kpiTarget.value.setText(
+            str(meta.get("target_column", meta.get("target", "—")))
+        )
+        self.kpiClasses.value.setText(
+            str(meta.get("num_classes", meta.get("classes", "—")))
+        )
 
-        if "F1_weighted" in metrics:
-            self.tabs.kpiF1.value.setText(f"{float(metrics['F1_weighted']):.4f}")
-        else:
-            self.tabs.kpiF1.value.setText("—")
-
-        self.tabs.kpiModel.value.setText(str(meta.get("model", "—")))
-        self.tabs.kpiTarget.value.setText(str(meta.get("target_column", "—")))
-        self.tabs.kpiClasses.value.setText(str(meta.get("num_classes", "—")))
-
-        # Class distribution chart
-        ax = self.tabs.ovBar.ax
+        # Class distribution
+        ax = self.ovBar.ax
         ax.clear()
         if (
             isinstance(bins, pd.DataFrame)
@@ -551,11 +624,11 @@ class DashboardPage(QtWidgets.QWidget):
             ax.bar(bins["bin_name"].astype(str), bins["count"])
             ax.set_xlabel("Class")
             ax.set_ylabel("Count")
-        self.tabs.ovBar.canvas.figure.tight_layout()
-        self.tabs.ovBar.canvas.draw()
+        self.ovBar.canvas.figure.tight_layout()
+        self.ovBar.canvas.draw()
 
-        # ROC preview chart
-        ax = self.tabs.ovRoc.ax
+        # ROC
+        ax = self.ovRoc.ax
         ax.clear()
         for r in roc_list[:3]:
             ax.plot(r["fpr"], r["tpr"], label=f"{r['class']} (AUC={r['auc']:.3f})")
@@ -564,52 +637,42 @@ class DashboardPage(QtWidgets.QWidget):
         ax.set_ylabel("TPR")
         if roc_list:
             ax.legend()
-        self.tabs.ovRoc.canvas.figure.tight_layout()
-        self.tabs.ovRoc.canvas.draw()
+        self.ovRoc.canvas.figure.tight_layout()
+        self.ovRoc.canvas.draw()
 
         # Feature importance tables per class
-        self._clear_layout(self.tabs.fiTablesLayout)
-
+        self._clear_layout(self.fiTablesLayout)
         shap_importance = results.get("shap_importance", {}) or {}
-        norm = {}
-        if isinstance(shap_importance, dict):
-            for k, v in shap_importance.items():
-                norm[str(k).strip().lower()] = v
+        if not isinstance(shap_importance, dict) or not shap_importance:
+            msg = QtWidgets.QLabel("No per-class feature importance available.")
+            msg.setStyleSheet("color:#666;")
+            self.fiTablesLayout.addWidget(msg, 0, 0)
+            return
 
-        # Determine class order from bins (preferred)
+        # Determine class order from bins if possible
         if (
             isinstance(bins, pd.DataFrame)
             and not bins.empty
             and "bin_name" in bins.columns
         ):
-            class_list = [str(x).strip().lower() for x in bins["bin_name"].tolist()]
+            class_list = [str(x) for x in bins["bin_name"].tolist()]
         else:
-            class_list = list(norm.keys())
-
-        if not class_list or not norm:
-            msg = QtWidgets.QLabel("No per-class feature importance available.")
-            msg.setStyleSheet("color:#666;")
-            self.tabs.fiTablesLayout.addWidget(msg, 0, 0)
-            return
+            class_list = [str(k) for k in shap_importance.keys()]
 
         cols_per_row = 3
-        added = 0
+        for idx, cls_name in enumerate(class_list):
+            # keys may be normalized in analysis, try both
+            df_cls = shap_importance.get(cls_name)
+            if df_cls is None:
+                df_cls = shap_importance.get(str(cls_name).strip().lower())
 
-        for idx, cls in enumerate(class_list):
-            df_cls = norm.get(cls)
             if not (isinstance(df_cls, pd.DataFrame) and not df_cls.empty):
                 continue
 
-            group = QtWidgets.QGroupBox(f"{cls} – Top 20 Features")
-            group.setSizePolicy(
-                QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding
-            )
+            group = QtWidgets.QGroupBox(f"{cls_name} – Top 20 Features")
             vbox = QtWidgets.QVBoxLayout(group)
 
             table = QtWidgets.QTableWidget()
-            table.setSizePolicy(
-                QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding
-            )
             table.setMinimumHeight(630)
             table.setColumnCount(8)
             table.setHorizontalHeaderLabels(
@@ -625,14 +688,12 @@ class DashboardPage(QtWidgets.QWidget):
                 ]
             )
             table.verticalHeader().setVisible(False)
-            table.setTextElideMode(Qt.ElideNone)
-            table.setWordWrap(True)
-            header = table.horizontalHeader()
-            header.setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
-            header.setStretchLastSection(True)
             table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
             table.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
             table.setAlternatingRowColors(True)
+            header = table.horizontalHeader()
+            header.setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
+            header.setStretchLastSection(True)
 
             top = df_cls.head(20).reset_index(drop=True)
             table.setRowCount(len(top))
@@ -692,21 +753,12 @@ class DashboardPage(QtWidgets.QWidget):
                     ),
                 )
 
-            table.resizeColumnsToContents()
             vbox.addWidget(table)
 
             row_i = idx // cols_per_row
             col_i = idx % cols_per_row
-            self.tabs.fiTablesLayout.addWidget(group, row_i, col_i)
-            self.tabs.fiTablesLayout.setColumnStretch(col_i, 1)
-            added += 1
-
-        if added == 0:
-            msg = QtWidgets.QLabel(
-                "No per-class feature importance tables were generated."
-            )
-            msg.setStyleSheet("color:#666;")
-            self.tabs.fiTablesLayout.addWidget(msg, 0, 0)
+            self.fiTablesLayout.addWidget(group, row_i, col_i)
+            self.fiTablesLayout.setColumnStretch(col_i, 1)
 
 
 # ------------------------- Main Window -------------------------
