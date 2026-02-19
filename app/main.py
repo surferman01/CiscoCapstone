@@ -1,17 +1,156 @@
 # main.py
-import sys, os, json
+import sys, os
+import re
 import pandas as pd
+
 from PySide6 import QtCore, QtGui, QtWidgets
 from PySide6.QtCore import Qt, Signal, Slot, QThreadPool, QRunnable, QObject
+
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
 from analysis import run_analysis
 from widgets import DropZone, ClickTile
 
-FIXED_CHART_HEIGHT = 280
+
+# -----------------------------
+# Weak (safe) metadata detection
+# -----------------------------
+_ID_NAME_RE = re.compile(
+    r"(serial|serno|s/n|sn\b|lot|wafer|unit|device|die|barcode|uuid|guid|hash|mac|imei|imsi|ip\b|hostname|name\b|id\b|identifier|index)",
+    re.IGNORECASE,
+)
+_DATE_NAME_RE = re.compile(r"(date|time|timestamp|datetime)", re.IGNORECASE)
 
 
+def suggest_drop_columns_weak(df: pd.DataFrame) -> list[str]:
+    """
+    Conservative suggestions:
+      - obvious ID/date columns by name
+      - datetime dtype
+      - mostly-unique string columns that are mostly non-numeric (typical IDs)
+    """
+    n = len(df)
+    if n == 0:
+        return []
+
+    drops = set()
+
+    for c in df.columns:
+        name = str(c)
+
+        if _ID_NAME_RE.search(name) or _DATE_NAME_RE.search(name):
+            drops.add(c)
+            continue
+
+        s = df[c]
+
+        if pd.api.types.is_datetime64_any_dtype(s):
+            drops.add(c)
+            continue
+
+        if pd.api.types.is_object_dtype(s) or pd.api.types.is_string_dtype(s):
+            non_null = s.dropna()
+            if len(non_null) < max(10, int(0.1 * n)):
+                continue
+
+            uniq_ratio = non_null.nunique(dropna=True) / max(1, len(non_null))
+            num_parse = pd.to_numeric(non_null, errors="coerce")
+            numericish_ratio = float(num_parse.notna().mean())
+
+            # mostly unique string-like AND mostly non-numeric => likely identifier
+            if uniq_ratio > 0.95 and numericish_ratio < 0.20:
+                drops.add(c)
+
+    return sorted(drops)
+
+
+# -----------------------------
+# Column drop selection dialog
+# -----------------------------
+class ColumnDropDialog(QtWidgets.QDialog):
+    """
+    Checklist dialog: checked columns will be excluded from model training features.
+    """
+
+    def __init__(self, parent, all_columns: list[str], prechecked: set[str]):
+        super().__init__(parent)
+        self.setWindowTitle("Review columns to exclude from training")
+        self.resize(640, 520)
+
+        root = QtWidgets.QVBoxLayout(self)
+
+        info = QtWidgets.QLabel(
+            "Checked columns will be EXCLUDED from model training features.\n"
+            "Uncheck any column you want to KEEP as a measurement feature."
+        )
+        info.setWordWrap(True)
+        root.addWidget(info)
+
+        # Search
+        self.search = QtWidgets.QLineEdit()
+        self.search.setPlaceholderText("Search columns…")
+        root.addWidget(self.search)
+
+        # List
+        self.list = QtWidgets.QListWidget()
+        self.list.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+        root.addWidget(self.list, stretch=1)
+
+        for c in all_columns:
+            item = QtWidgets.QListWidgetItem(str(c))
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked if c in prechecked else Qt.Unchecked)
+            self.list.addItem(item)
+
+        # Quick actions
+        btn_row = QtWidgets.QHBoxLayout()
+        self.checkAllBtn = QtWidgets.QPushButton("Check all")
+        self.uncheckAllBtn = QtWidgets.QPushButton("Uncheck all")
+        btn_row.addWidget(self.checkAllBtn)
+        btn_row.addWidget(self.uncheckAllBtn)
+        btn_row.addStretch(1)
+        root.addLayout(btn_row)
+
+        # OK/Cancel
+        buttons = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
+        )
+        root.addWidget(buttons)
+
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+
+        self.checkAllBtn.clicked.connect(self._check_all)
+        self.uncheckAllBtn.clicked.connect(self._uncheck_all)
+        self.search.textChanged.connect(self._filter)
+
+    def _check_all(self):
+        for i in range(self.list.count()):
+            self.list.item(i).setCheckState(Qt.Checked)
+
+    def _uncheck_all(self):
+        for i in range(self.list.count()):
+            self.list.item(i).setCheckState(Qt.Unchecked)
+
+    def _filter(self, text: str):
+        text = (text or "").lower().strip()
+        for i in range(self.list.count()):
+            item = self.list.item(i)
+            item.setHidden(bool(text) and text not in item.text().lower())
+
+    def selected_drops(self) -> list[str]:
+        drops = []
+        for i in range(self.list.count()):
+            item = self.list.item(i)
+            if item.checkState() == Qt.Checked:
+                drops.append(item.text())
+        return drops
+
+
+# -----------------------------
+# Pandas model for QTableView
+# -----------------------------
 class PandasModel(QtCore.QAbstractTableModel):
     def __init__(self, df=pd.DataFrame(), parent=None, max_rows: int = 1000):
         super().__init__(parent)
@@ -42,6 +181,9 @@ class PandasModel(QtCore.QAbstractTableModel):
         self.endResetModel()
 
 
+# -----------------------------
+# Worker / ThreadPool
+# -----------------------------
 class WorkerSignals(QObject):
     finished = Signal(object)
     status = Signal(str)
@@ -64,7 +206,9 @@ class TrainWorker(QRunnable):
             self.signals.finished.emit(e)
 
 
-# ------------------------- Splash Page -------------------------
+# -----------------------------
+# Splash Page
+# -----------------------------
 class SplashPage(QtWidgets.QWidget):
     requestTrain = Signal(str, dict)
     requestLoadTrained = Signal(str)
@@ -73,6 +217,7 @@ class SplashPage(QtWidgets.QWidget):
         super().__init__()
         layout = QtWidgets.QVBoxLayout(self)
 
+        # Title + logo
         title = QtWidgets.QLabel("Cisco Silicon Failure Characterization")
         title.setObjectName("titleBar")
         title.setAlignment(Qt.AlignCenter)
@@ -88,6 +233,7 @@ class SplashPage(QtWidgets.QWidget):
             logo.setText("cisco")
         layout.addWidget(logo)
 
+        # --- Three equal columns
         columns = QtWidgets.QHBoxLayout()
         columns.setSpacing(18)
         layout.addLayout(columns, stretch=1)
@@ -113,6 +259,14 @@ class SplashPage(QtWidgets.QWidget):
         self.selectedLabel.setWordWrap(True)
         self.selectedLabel.setStyleSheet("color:#666;")
 
+        self.dropSummary = QtWidgets.QLabel("Drop columns: —")
+        self.dropSummary.setWordWrap(True)
+        self.dropSummary.setStyleSheet("color:#666;")
+
+        self.reviewDropsBtn = QtWidgets.QPushButton("Review Drops…")
+        self.reviewDropsBtn.setMinimumHeight(36)
+        self.reviewDropsBtn.setEnabled(False)
+
         orLbl = QtWidgets.QLabel("— or —")
         orLbl.setAlignment(Qt.AlignCenter)
         orLbl.setStyleSheet("color:#888;")
@@ -121,6 +275,8 @@ class SplashPage(QtWidgets.QWidget):
         left.layout().addWidget(orLbl)
         left.layout().addWidget(self.browseBtn)
         left.layout().addWidget(self.selectedLabel)
+        left.layout().addWidget(self.dropSummary)
+        left.layout().addWidget(self.reviewDropsBtn)
         left.layout().addStretch(1)
         columns.addWidget(left, 1)
 
@@ -191,22 +347,32 @@ class SplashPage(QtWidgets.QWidget):
         columns.setStretch(1, 1)
         columns.setStretch(2, 1)
 
-        # connections
+        # State
+        self.data_path = None
+        self.recommended_targets: list[str] = []
+        self.all_columns: list[str] = []
+        self.suggested_drop_cols: list[str] = []
+        self.user_drop_cols: list[str] = []
+
+        # Connections
         self.drop.fileDropped.connect(self._on_file_dropped)
         self.browseBtn.clicked.connect(self._on_browse_clicked)
-        self.loadTileBtn.clicked.connect(self._on_load_trained_clicked)
+        self.reviewDropsBtn.clicked.connect(self._on_review_drops)
 
         self.combo.currentIndexChanged.connect(self._update_train_enabled)
         self.targetCombo.currentTextChanged.connect(self._update_train_enabled)
-
         self.trainBtn.clicked.connect(self._on_train_click)
-        self.recommended_targets = []
 
-        self.data_path = None
+        self.loadTileBtn.clicked.connect(self._on_load_trained_clicked)
+
         self._update_train_enabled()
 
-    def _recommend_targets(self, df: pd.DataFrame, max_cols: int = 10):
-        # “similar to your snippet”: not fully numeric columns are good candidates
+    def _recommend_targets(self, df: pd.DataFrame, max_cols: int = 10) -> list[str]:
+        """
+        Similar to your snippet:
+          - columns that are not fully numeric are good target candidates
+          - also include low-cardinality numeric columns as secondary
+        """
         candidates = []
         for c in df.columns:
             s = df[c]
@@ -215,7 +381,7 @@ class SplashPage(QtWidgets.QWidget):
             all_numeric = pd.to_numeric(s, errors="coerce").notna().all()
             if not all_numeric:
                 candidates.append(c)
-        # Also include low-cardinality numeric as secondary candidates
+
         for c in df.columns:
             if c in candidates:
                 continue
@@ -232,15 +398,18 @@ class SplashPage(QtWidgets.QWidget):
         self.data_path = path
         self.selectedLabel.setText(f"Selected: {os.path.basename(path)}")
 
-        # Populate target recommendations
+        # Parse preview to populate targets + drop suggestions
         try:
             if path.lower().endswith(".csv"):
                 df_preview = pd.read_csv(path, nrows=5000)
             else:
                 df_preview = pd.read_parquet(path).head(5000)
 
+            self.all_columns = list(df_preview.columns)
+
+            # Recommended targets for target selection
             recs = self._recommend_targets(df_preview)
-            self.recommended_targets = recs[:]  # store for training-time excludes
+            self.recommended_targets = recs[:]
 
             self.targetCombo.blockSignals(True)
             self.targetCombo.clear()
@@ -257,10 +426,35 @@ class SplashPage(QtWidgets.QWidget):
                 )
             self.targetCombo.blockSignals(False)
 
+            # Suggested metadata drops (weak filter)
+            self.suggested_drop_cols = suggest_drop_columns_weak(df_preview)
+            self.user_drop_cols = list(self.suggested_drop_cols)
+
+            self.dropSummary.setText(
+                f"Drop columns: {len(self.user_drop_cols)} (click Review Drops…)"
+            )
+            self.reviewDropsBtn.setEnabled(True)
+
         except Exception as e:
             self.targetHint.setText(f"Could not parse columns: {e}")
+            self.all_columns = []
+            self.recommended_targets = []
+            self.suggested_drop_cols = []
+            self.user_drop_cols = []
+            self.dropSummary.setText("Drop columns: —")
+            self.reviewDropsBtn.setEnabled(False)
 
         self._update_train_enabled()
+
+    def _on_review_drops(self):
+        if not self.all_columns:
+            return
+
+        prechecked = set(self.user_drop_cols or self.suggested_drop_cols or [])
+        dlg = ColumnDropDialog(self, self.all_columns, prechecked)
+        if dlg.exec() == QtWidgets.QDialog.Accepted:
+            self.user_drop_cols = dlg.selected_drops()
+            self.dropSummary.setText(f"Drop columns: {len(self.user_drop_cols)} (customized)")
 
     def _on_file_dropped(self, path: str):
         if path:
@@ -276,25 +470,14 @@ class SplashPage(QtWidgets.QWidget):
         if path:
             self._set_data_path(path)
 
-    def _has_data(self) -> bool:
-        return bool(self.data_path)
-
-    def _valid_model(self) -> bool:
-        return self.combo.currentText() in {"CatBoost", "XGBoost"}
-
-    def _valid_target(self) -> bool:
-        return bool(self.targetCombo.currentText().strip())
-
     def _update_train_enabled(self):
-        self.trainBtn.setEnabled(
-            self._has_data() and self._valid_model() and self._valid_target()
-        )
+        valid_model = self.combo.currentText() in {"CatBoost", "XGBoost"}
+        valid_target = bool(self.targetCombo.currentText().strip())
+        self.trainBtn.setEnabled(bool(self.data_path) and valid_model and valid_target)
 
     def _on_train_click(self):
         if not self.data_path:
-            QtWidgets.QMessageBox.information(
-                self, "No data", "Choose a dataset first."
-            )
+            QtWidgets.QMessageBox.information(self, "No data", "Choose a dataset first.")
             return
 
         model_type = self.combo.currentText()
@@ -311,7 +494,7 @@ class SplashPage(QtWidgets.QWidget):
             )
             return
 
-        # Validate quickly
+        # quick validation (fast preview)
         try:
             if self.data_path.lower().endswith(".csv"):
                 df_check = pd.read_csv(self.data_path, nrows=5000)
@@ -320,17 +503,13 @@ class SplashPage(QtWidgets.QWidget):
 
             if target_col not in df_check.columns:
                 QtWidgets.QMessageBox.critical(
-                    self,
-                    "Invalid target",
-                    f"Column '{target_col}' not found in dataset.",
+                    self, "Invalid target", f"Column '{target_col}' not found in dataset."
                 )
                 return
 
             if df_check[target_col].dropna().nunique() < 2:
                 QtWidgets.QMessageBox.critical(
-                    self,
-                    "Invalid target",
-                    f"Target '{target_col}' has < 2 unique values.",
+                    self, "Invalid target", f"Target '{target_col}' has < 2 unique values."
                 )
                 return
 
@@ -338,38 +517,58 @@ class SplashPage(QtWidgets.QWidget):
             QtWidgets.QMessageBox.critical(self, "Validation failed", str(e))
             return
 
+        recs = list(self.recommended_targets or [])
+        user_drops = list(self.user_drop_cols or [])
+
+        # Always exclude other recommended targets (except the chosen target)
+        rec_excludes = [c for c in recs if c != target_col]
+
+        # Merge & never drop chosen target
+        exclude_cols = sorted(set(user_drops) | set(rec_excludes))
+        exclude_cols = [c for c in exclude_cols if c != target_col]
+
         config = {
             "model_type": model_type,
             "use_gpu": self.gpuCheck.isChecked(),
             "target_column": target_col,
-            "exclude_columns": [
-                c for c in (self.recommended_targets or []) if c != target_col
-            ],
+
+            # analysis.py can use this for additional safe exclusion/reporting
+            "recommended_targets": recs,
+
+            # final per-run exclusions (UI-controlled)
+            "exclude_columns": exclude_cols,
         }
+
+        # Optional small confirmation (comment out if you don't want popups)
+        # preview = "\n".join(exclude_cols[:25])
+        # more = "" if len(exclude_cols) <= 25 else f"\n… (+{len(exclude_cols)-25} more)"
+        # QtWidgets.QMessageBox.information(
+        #     self,
+        #     "Training exclusions",
+        #     f"Excluding {len(exclude_cols)} columns from training features.\n\n{preview}{more}",
+        # )
+
         self.requestTrain.emit(self.data_path, config)
 
     def _on_load_trained_clicked(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self,
-            "Open trained artifact",
-            "",
-            "Pickle/Model Files (*.*)",
+            self, "Open trained artifact", "", "Pickle/Model Files (*.*)"
         )
         if path:
             self.modelLabel.setText(f"Selected: {os.path.basename(path)}")
             self.requestLoadTrained.emit(path)
 
 
-# ------------------------- Training Page -------------------------
+# -----------------------------
+# Training Page
+# -----------------------------
 class TrainingPage(QtWidgets.QWidget):
     cancelRequested = Signal()
 
     def __init__(self):
         super().__init__()
         layout = QtWidgets.QVBoxLayout(self)
-        title = QtWidgets.QLabel(
-            "Cisco Silicon Failure Characterization", alignment=Qt.AlignCenter
-        )
+        title = QtWidgets.QLabel("Cisco Silicon Failure Characterization", alignment=Qt.AlignCenter)
         title.setObjectName("titleBar")
         layout.addWidget(title)
 
@@ -396,31 +595,13 @@ class TrainingPage(QtWidgets.QWidget):
         layout.addWidget(self.modifyBtn, alignment=Qt.AlignRight)
 
 
-# ------------------------- Dashboard -------------------------
-class ChartCard(QtWidgets.QGroupBox):
-    def __init__(self, title: str, height: int = 380):
-        super().__init__(title)
-        self.setLayout(QtWidgets.QVBoxLayout())
-        self.layout().setContentsMargins(12, 12, 12, 12)
-        self.layout().setSpacing(8)
-
-        self.canvas = FigureCanvas(Figure(figsize=(6, 3), dpi=100))
-        self.canvas.setSizePolicy(
-            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding
-        )
-        self.ax = self.canvas.figure.add_subplot(111)
-        self.layout().addWidget(self.canvas)
-
-        # ✅ fixed card height prevents “fill page” stretching
-        self.setMinimumHeight(height)
-        self.setMaximumHeight(height)
-
-
+# -----------------------------
+# Dashboard UI widgets
+# -----------------------------
 class KPIBox(QtWidgets.QGroupBox):
     def __init__(self, title: str):
         super().__init__(title)
         self.setObjectName("kpiBox")
-
         self.setMinimumHeight(110)
         self.setMaximumHeight(130)
 
@@ -434,23 +615,292 @@ class KPIBox(QtWidgets.QGroupBox):
         f.setBold(True)
         self.value.setFont(f)
 
-        v.addStretch(1)  # can change this to 2
+        v.addStretch(1)
         v.addWidget(self.value)
         v.addStretch(1)
 
 
+class ChartCard(QtWidgets.QGroupBox):
+    def __init__(self, title: str, height: int = 380):
+        super().__init__(title)
+        self.setLayout(QtWidgets.QVBoxLayout())
+        self.layout().setContentsMargins(12, 12, 12, 12)
+        self.layout().setSpacing(8)
+
+        self.canvas = FigureCanvas(Figure(figsize=(6, 3), dpi=100))
+        self.canvas.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+        self.ax = self.canvas.figure.add_subplot(111)
+
+        self.layout().addWidget(self.canvas)
+
+        # fixed card height so charts don't stretch to fill the entire page
+        self.setMinimumHeight(height)
+        self.setMaximumHeight(height)
+
+
+# -----------------------------
+# Dashboard Tabs (3 tabs only)
+# -----------------------------
+class DashboardTabs(QtWidgets.QTabWidget):
+    def __init__(self):
+        super().__init__()
+
+        self.dashboard = QtWidgets.QWidget()
+        self.tablePage = QtWidgets.QWidget()
+        self.fiPage = QtWidgets.QWidget()
+
+        self.addTab(self.dashboard, "Dashboard")
+        self.addTab(self.tablePage, "Data Table")
+        self.addTab(self.fiPage, "Feature Importance")
+
+        # Dashboard tab (no scroll; fixed-size KPIs and charts)
+        d = QtWidgets.QVBoxLayout(self.dashboard)
+        d.setContentsMargins(12, 12, 12, 12)
+        d.setSpacing(16)
+
+        kpi_row = QtWidgets.QHBoxLayout()
+        kpi_row.setSpacing(16)
+
+        self.kpiAccuracy = KPIBox("Accuracy")
+        self.kpiPrecision = KPIBox("Precision (w)")
+        self.kpiRecall = KPIBox("Recall (w)")
+        self.kpiF1 = KPIBox("F1 (weighted)")
+        self.kpiModel = KPIBox("Model")
+        self.kpiTarget = KPIBox("Target")
+        self.kpiClasses = KPIBox("Classes")
+
+
+        kpi_row.addWidget(self.kpiAccuracy, 1)
+        kpi_row.addWidget(self.kpiPrecision, 1)
+        kpi_row.addWidget(self.kpiRecall, 1)
+        kpi_row.addWidget(self.kpiF1, 1)
+        kpi_row.addWidget(self.kpiModel, 1)
+        kpi_row.addWidget(self.kpiTarget, 1)
+        kpi_row.addWidget(self.kpiClasses, 1)
+
+
+        kpi_wrap = QtWidgets.QWidget()
+        kpi_wrap.setLayout(kpi_row)
+        kpi_wrap.setMinimumHeight(130)
+        kpi_wrap.setMaximumHeight(140)
+        d.addWidget(kpi_wrap)
+
+        self.ovBar = ChartCard("Class Distribution (Test)", height=380)
+        self.ovRoc = ChartCard("ROC Curves (Preview)", height=380)
+
+        charts_row = QtWidgets.QHBoxLayout()
+        charts_row.setSpacing(16)
+        charts_row.addWidget(self.ovBar, 1)
+        charts_row.addWidget(self.ovRoc, 1)
+
+        charts_wrap = QtWidgets.QWidget()
+        charts_wrap.setLayout(charts_row)
+        charts_wrap.setMinimumHeight(380)
+        charts_wrap.setMaximumHeight(380)
+        d.addWidget(charts_wrap)
+
+        d.addStretch(1)
+
+        # Data Table tab
+        tl = QtWidgets.QVBoxLayout(self.tablePage)
+        tl.setContentsMargins(12, 12, 12, 12)
+
+        self.table = QtWidgets.QTableView()
+        self.table.setSortingEnabled(True)
+        self.table.setAlternatingRowColors(True)
+        tl.addWidget(self.table)
+
+        # Feature Importance tab (scroll)
+        fi_outer = QtWidgets.QVBoxLayout(self.fiPage)
+        fi_outer.setContentsMargins(0, 0, 0, 0)
+
+        self.fiScroll = QtWidgets.QScrollArea()
+        self.fiScroll.setWidgetResizable(True)
+        self.fiScroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.fiScroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        fi_outer.addWidget(self.fiScroll)
+
+        fi_inner = QtWidgets.QWidget()
+        self.fiScroll.setWidget(fi_inner)
+
+        fl = QtWidgets.QVBoxLayout(fi_inner)
+        fl.setContentsMargins(12, 12, 12, 12)
+        fl.setSpacing(12)
+
+        self.fiHeader = QtWidgets.QLabel("Top 20 features by SHAP (one table per class/bin).")
+        self.fiHeader.setWordWrap(True)
+        fl.addWidget(self.fiHeader)
+
+        self.fiTablesLayout = QtWidgets.QGridLayout()
+        self.fiTablesLayout.setHorizontalSpacing(12)
+        self.fiTablesLayout.setVerticalSpacing(12)
+        self.fiTablesLayout.setAlignment(Qt.AlignTop)
+        fl.addLayout(self.fiTablesLayout)
+
+        fl.addStretch(1)
+
+    def _clear_layout(self, layout: QtWidgets.QLayout):
+        while layout.count():
+            item = layout.takeAt(0)
+            widget = item.widget()
+            child_layout = item.layout()
+            if widget:
+                widget.deleteLater()
+            elif child_layout:
+                self._clear_layout(child_layout)
+
+    def populate(self, results: dict):
+        # Data table
+        df = results.get("dataframe", pd.DataFrame())
+        self.table.setModel(PandasModel(df))
+
+        meta = results.get("meta", {}) or {}
+        metrics = results.get("metrics", {}) or {}
+        bins = results.get("bins", pd.DataFrame())
+        roc_list = results.get("roc", [])
+
+        # KPIs
+        self.kpiAccuracy.value.setText(
+            f"{float(metrics.get('Accuracy', 0.0)):.4f}" if "Accuracy" in metrics else "—"
+        )
+        # Precision/Recall (weighted) – best source is classification_report dict if present
+        prec_w = None
+        rec_w = None
+
+        report = results.get("classification_report")
+        if isinstance(report, dict):
+            wavg = report.get("weighted avg") or {}
+            if isinstance(wavg, dict):
+                prec_w = wavg.get("precision")
+                rec_w = wavg.get("recall")
+
+        # fallback: allow metrics dict to supply these later if you add them in analysis.py
+        if prec_w is None:
+            prec_w = metrics.get("Precision_weighted")
+        if rec_w is None:
+            rec_w = metrics.get("Recall_weighted")
+
+        self.kpiPrecision.value.setText(f"{float(prec_w):.4f}" if prec_w is not None else "—")
+        self.kpiRecall.value.setText(f"{float(rec_w):.4f}" if rec_w is not None else "—")
+
+        self.kpiF1.value.setText(
+            f"{float(metrics.get('F1_weighted', 0.0)):.4f}" if "F1_weighted" in metrics else "—"
+        )
+        self.kpiModel.value.setText(str(meta.get("model", meta.get("model_name", "—"))))
+        self.kpiTarget.value.setText(str(meta.get("target_column", meta.get("target", "—"))))
+        self.kpiClasses.value.setText(str(meta.get("num_classes", meta.get("classes", "—"))))
+
+        # Class distribution
+        ax = self.ovBar.ax
+        ax.clear()
+        if isinstance(bins, pd.DataFrame) and not bins.empty and {"bin_name", "count"}.issubset(bins.columns):
+            ax.bar(bins["bin_name"].astype(str), bins["count"])
+            ax.set_xlabel("Class")
+            ax.set_ylabel("Count")
+        self.ovBar.canvas.figure.tight_layout()
+        self.ovBar.canvas.draw()
+
+        # ROC preview
+        ax = self.ovRoc.ax
+        ax.clear()
+        for r in roc_list[:3]:
+            ax.plot(r["fpr"], r["tpr"], label=f"{r['class']} (AUC={r['auc']:.3f})")
+        ax.plot([0, 1], [0, 1], "--", linewidth=1)
+        ax.set_xlabel("FPR")
+        ax.set_ylabel("TPR")
+        if roc_list:
+            ax.legend()
+        self.ovRoc.canvas.figure.tight_layout()
+        self.ovRoc.canvas.draw()
+
+        # Feature importance tables
+        self._clear_layout(self.fiTablesLayout)
+        shap_importance = results.get("shap_importance", {}) or {}
+
+        if not isinstance(shap_importance, dict) or not shap_importance:
+            msg = QtWidgets.QLabel("No per-class feature importance available.")
+            msg.setStyleSheet("color:#666;")
+            self.fiTablesLayout.addWidget(msg, 0, 0)
+            return
+
+        # Prefer ordering from bins
+        if isinstance(bins, pd.DataFrame) and not bins.empty and "bin_name" in bins.columns:
+            class_list = [str(x) for x in bins["bin_name"].tolist()]
+        else:
+            class_list = [str(k) for k in shap_importance.keys()]
+
+        cols_per_row = 3
+        added = 0
+
+        for idx, cls_name in enumerate(class_list):
+            df_cls = shap_importance.get(cls_name)
+            if df_cls is None:
+                df_cls = shap_importance.get(str(cls_name).strip().lower())
+
+            if not (isinstance(df_cls, pd.DataFrame) and not df_cls.empty):
+                continue
+
+            group = QtWidgets.QGroupBox(f"{cls_name} – Top 20 Features")
+            vbox = QtWidgets.QVBoxLayout(group)
+
+            table = QtWidgets.QTableWidget()
+            table.setMinimumHeight(630)
+            table.setColumnCount(8)
+            table.setHorizontalHeaderLabels(
+                ["Rank", "Feature", "SHAP |Δ|", "Share (%)", "Direction", "Failure Avg", "PASS Avg", "PASS Std"]
+            )
+            table.verticalHeader().setVisible(False)
+            table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+            table.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+            table.setAlternatingRowColors(True)
+            header = table.horizontalHeader()
+            header.setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
+            header.setStretchLastSection(True)
+
+            top = df_cls.head(20).reset_index(drop=True)
+            table.setRowCount(len(top))
+
+            for r, row in top.iterrows():
+                table.setItem(r, 0, QtWidgets.QTableWidgetItem(str(int(row.get("rank", r + 1)))))
+                table.setItem(r, 1, QtWidgets.QTableWidgetItem(str(row.get("feature", ""))))
+                table.setItem(r, 2, QtWidgets.QTableWidgetItem(f"{float(row.get('importance', 0.0)):.4f}"))
+                table.setItem(r, 3, QtWidgets.QTableWidgetItem(f"{float(row.get('share_pct', 0.0)):.1f}"))
+                table.setItem(r, 4, QtWidgets.QTableWidgetItem(f"{float(row.get('direction', 0.0)):.4f}"))
+
+                fa = row.get("failure_avg")
+                pa = row.get("pass_avg")
+                ps = row.get("pass_std")
+
+                table.setItem(r, 5, QtWidgets.QTableWidgetItem("" if pd.isna(fa) else f"{float(fa):.4f}"))
+                table.setItem(r, 6, QtWidgets.QTableWidgetItem("" if pd.isna(pa) else f"{float(pa):.4f}"))
+                table.setItem(r, 7, QtWidgets.QTableWidgetItem("" if pd.isna(ps) else f"{float(ps):.4f}"))
+
+            vbox.addWidget(table)
+
+            row_i = idx // cols_per_row
+            col_i = idx % cols_per_row
+            self.fiTablesLayout.addWidget(group, row_i, col_i)
+            self.fiTablesLayout.setColumnStretch(col_i, 1)
+            added += 1
+
+        if added == 0:
+            msg = QtWidgets.QLabel("No per-class feature importance tables were generated.")
+            msg.setStyleSheet("color:#666;")
+            self.fiTablesLayout.addWidget(msg, 0, 0)
+
+
+# -----------------------------
+# Dashboard Page
+# -----------------------------
 class DashboardPage(QtWidgets.QWidget):
     requestModify = Signal()
     requestSave = Signal()
 
     def __init__(self):
         super().__init__()
-
         root = QtWidgets.QVBoxLayout(self)
 
-        title = QtWidgets.QLabel(
-            "Cisco Silicon Failure Characterization", alignment=Qt.AlignCenter
-        )
+        title = QtWidgets.QLabel("Cisco Silicon Failure Characterization", alignment=Qt.AlignCenter)
         title.setObjectName("titleBar")
         root.addWidget(title)
 
@@ -471,302 +921,14 @@ class DashboardPage(QtWidgets.QWidget):
         self.tabs.populate(results)
 
 
-class DashboardTabs(QtWidgets.QTabWidget):
-    def __init__(self):
-        super().__init__()
-
-        # --- Tabs
-        self.dashboard = QtWidgets.QWidget()
-        self.tablePage = QtWidgets.QWidget()
-        self.fiPage = QtWidgets.QWidget()
-
-        self.addTab(self.dashboard, "Dashboard")
-        self.addTab(self.tablePage, "Data Table")
-        self.addTab(self.fiPage, "Feature Importance")
-
-        # =======================
-        # Dashboard tab (NO SCROLL)
-        # =======================
-        d = QtWidgets.QVBoxLayout(self.dashboard)
-        d.setContentsMargins(12, 12, 12, 12)
-        d.setSpacing(16)
-
-        # KPI row (fixed height)
-        kpi_row = QtWidgets.QHBoxLayout()
-        kpi_row.setSpacing(16)
-
-        self.kpiAccuracy = KPIBox("Accuracy")
-        self.kpiF1 = KPIBox("F1 (weighted)")
-        self.kpiModel = KPIBox("Model")
-        self.kpiTarget = KPIBox("Target")
-        self.kpiClasses = KPIBox("Classes")
-
-        kpi_row.addWidget(self.kpiAccuracy, 1)
-        kpi_row.addWidget(self.kpiF1, 1)
-        kpi_row.addWidget(self.kpiModel, 1)
-        kpi_row.addWidget(self.kpiTarget, 1)
-        kpi_row.addWidget(self.kpiClasses, 1)
-
-        kpi_wrap = QtWidgets.QWidget()
-        kpi_wrap.setLayout(kpi_row)
-        kpi_wrap.setMinimumHeight(130)
-        kpi_wrap.setMaximumHeight(140)
-        d.addWidget(kpi_wrap)
-
-        # Charts row (fixed height cards so nothing stretches)
-        self.ovBar = ChartCard("Class Distribution (Test)", height=380)
-        self.ovRoc = ChartCard("ROC Curves (Preview)", height=380)
-
-        charts_row = QtWidgets.QHBoxLayout()
-        charts_row.setSpacing(16)
-        charts_row.addWidget(self.ovBar, 1)
-        charts_row.addWidget(self.ovRoc, 1)
-
-        charts_wrap = QtWidgets.QWidget()
-        charts_wrap.setLayout(charts_row)
-        charts_wrap.setMinimumHeight(380)
-        charts_wrap.setMaximumHeight(380)
-        d.addWidget(charts_wrap)
-
-        d.addStretch(1)
-
-        # =======================
-        # Data Table tab
-        # =======================
-        tl = QtWidgets.QVBoxLayout(self.tablePage)
-        tl.setContentsMargins(12, 12, 12, 12)
-        self.table = QtWidgets.QTableView()
-        self.table.setSortingEnabled(True)
-        self.table.setAlternatingRowColors(True)
-        tl.addWidget(self.table)
-
-        # =======================
-        # Feature Importance tab (SCROLL)
-        # =======================
-        fi_outer = QtWidgets.QVBoxLayout(self.fiPage)
-        fi_outer.setContentsMargins(0, 0, 0, 0)
-
-        self.fiScroll = QtWidgets.QScrollArea()
-        self.fiScroll.setWidgetResizable(True)
-        self.fiScroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.fiScroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-
-        fi_outer.addWidget(self.fiScroll)
-
-        fi_inner = QtWidgets.QWidget()
-        self.fiScroll.setWidget(fi_inner)
-
-        fl = QtWidgets.QVBoxLayout(fi_inner)
-        fl.setContentsMargins(12, 12, 12, 12)
-        fl.setSpacing(12)
-
-        self.fiHeader = QtWidgets.QLabel("Top 20 features by SHAP.")
-        self.fiHeader.setWordWrap(True)
-        fl.addWidget(self.fiHeader)
-
-        self.fiTablesLayout = QtWidgets.QGridLayout()
-        self.fiTablesLayout.setHorizontalSpacing(12)
-        self.fiTablesLayout.setVerticalSpacing(12)
-        self.fiTablesLayout.setAlignment(Qt.AlignTop)
-        fl.addLayout(self.fiTablesLayout)
-
-        fl.addStretch(1)
-
-    # ------------ helpers ------------
-    def _clear_layout(self, layout: QtWidgets.QLayout):
-        while layout.count():
-            item = layout.takeAt(0)
-            widget = item.widget()
-            child_layout = item.layout()
-            if widget:
-                widget.deleteLater()
-            elif child_layout:
-                self._clear_layout(child_layout)
-
-    # ------------ public ------------
-    def populate(self, results: dict):
-        # Data table
-        df = results.get("dataframe", pd.DataFrame())
-        self.table.setModel(PandasModel(df))
-
-        meta = results.get("meta", {}) or {}
-        metrics = results.get("metrics", {}) or {}
-        bins = results.get("bins", pd.DataFrame())
-        roc_list = results.get("roc", [])
-
-        # KPIs
-        self.kpiAccuracy.value.setText(
-            f"{float(metrics.get('Accuracy', 0.0)):.4f}"
-            if "Accuracy" in metrics
-            else "—"
-        )
-        self.kpiF1.value.setText(
-            f"{float(metrics.get('F1_weighted', 0.0)):.4f}"
-            if "F1_weighted" in metrics
-            else "—"
-        )
-        self.kpiModel.value.setText(str(meta.get("model", meta.get("model_name", "—"))))
-        self.kpiTarget.value.setText(
-            str(meta.get("target_column", meta.get("target", "—")))
-        )
-        self.kpiClasses.value.setText(
-            str(meta.get("num_classes", meta.get("classes", "—")))
-        )
-
-        # Class distribution
-        ax = self.ovBar.ax
-        ax.clear()
-        if (
-            isinstance(bins, pd.DataFrame)
-            and not bins.empty
-            and {"bin_name", "count"}.issubset(bins.columns)
-        ):
-            ax.bar(bins["bin_name"].astype(str), bins["count"])
-            ax.set_xlabel("Class")
-            ax.set_ylabel("Count")
-        self.ovBar.canvas.figure.tight_layout()
-        self.ovBar.canvas.draw()
-
-        # ROC
-        ax = self.ovRoc.ax
-        ax.clear()
-        for r in roc_list[:3]:
-            ax.plot(r["fpr"], r["tpr"], label=f"{r['class']} (AUC={r['auc']:.3f})")
-        ax.plot([0, 1], [0, 1], "--", linewidth=1)
-        ax.set_xlabel("FPR")
-        ax.set_ylabel("TPR")
-        if roc_list:
-            ax.legend()
-        self.ovRoc.canvas.figure.tight_layout()
-        self.ovRoc.canvas.draw()
-
-        # Feature importance tables per class
-        self._clear_layout(self.fiTablesLayout)
-        shap_importance = results.get("shap_importance", {}) or {}
-        if not isinstance(shap_importance, dict) or not shap_importance:
-            msg = QtWidgets.QLabel("No per-class feature importance available.")
-            msg.setStyleSheet("color:#666;")
-            self.fiTablesLayout.addWidget(msg, 0, 0)
-            return
-
-        # Determine class order from bins if possible
-        if (
-            isinstance(bins, pd.DataFrame)
-            and not bins.empty
-            and "bin_name" in bins.columns
-        ):
-            class_list = [str(x) for x in bins["bin_name"].tolist()]
-        else:
-            class_list = [str(k) for k in shap_importance.keys()]
-
-        cols_per_row = 3
-        for idx, cls_name in enumerate(class_list):
-            # keys may be normalized in analysis, try both
-            df_cls = shap_importance.get(cls_name)
-            if df_cls is None:
-                df_cls = shap_importance.get(str(cls_name).strip().lower())
-
-            if not (isinstance(df_cls, pd.DataFrame) and not df_cls.empty):
-                continue
-
-            group = QtWidgets.QGroupBox(f"{cls_name} – Top 20 Features")
-            vbox = QtWidgets.QVBoxLayout(group)
-
-            table = QtWidgets.QTableWidget()
-            table.setMinimumHeight(630)
-            table.setColumnCount(8)
-            table.setHorizontalHeaderLabels(
-                [
-                    "Rank",
-                    "Feature",
-                    "SHAP |Δ|",
-                    "Share (%)",
-                    "Direction",
-                    "Failure Avg",
-                    "PASS Avg",
-                    "PASS Std",
-                ]
-            )
-            table.verticalHeader().setVisible(False)
-            table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
-            table.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
-            table.setAlternatingRowColors(True)
-            header = table.horizontalHeader()
-            header.setSectionResizeMode(QtWidgets.QHeaderView.ResizeToContents)
-            header.setStretchLastSection(True)
-
-            top = df_cls.head(20).reset_index(drop=True)
-            table.setRowCount(len(top))
-
-            for r, row in top.iterrows():
-                table.setItem(
-                    r, 0, QtWidgets.QTableWidgetItem(str(int(row.get("rank", r + 1))))
-                )
-                table.setItem(
-                    r, 1, QtWidgets.QTableWidgetItem(str(row.get("feature", "")))
-                )
-                table.setItem(
-                    r,
-                    2,
-                    QtWidgets.QTableWidgetItem(
-                        f"{float(row.get('importance', 0.0)):.4f}"
-                    ),
-                )
-                table.setItem(
-                    r,
-                    3,
-                    QtWidgets.QTableWidgetItem(
-                        f"{float(row.get('share_pct', 0.0)):.1f}"
-                    ),
-                )
-                table.setItem(
-                    r,
-                    4,
-                    QtWidgets.QTableWidgetItem(
-                        f"{float(row.get('direction', 0.0)):.4f}"
-                    ),
-                )
-
-                fa = row.get("failure_avg")
-                pa = row.get("pass_avg")
-                ps = row.get("pass_std")
-
-                table.setItem(
-                    r,
-                    5,
-                    QtWidgets.QTableWidgetItem(
-                        "" if pd.isna(fa) else f"{float(fa):.4f}"
-                    ),
-                )
-                table.setItem(
-                    r,
-                    6,
-                    QtWidgets.QTableWidgetItem(
-                        "" if pd.isna(pa) else f"{float(pa):.4f}"
-                    ),
-                )
-                table.setItem(
-                    r,
-                    7,
-                    QtWidgets.QTableWidgetItem(
-                        "" if pd.isna(ps) else f"{float(ps):.4f}"
-                    ),
-                )
-
-            vbox.addWidget(table)
-
-            row_i = idx // cols_per_row
-            col_i = idx % cols_per_row
-            self.fiTablesLayout.addWidget(group, row_i, col_i)
-            self.fiTablesLayout.setColumnStretch(col_i, 1)
-
-
-# ------------------------- Main Window -------------------------
+# -----------------------------
+# Main Window
+# -----------------------------
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Cisco Silicon Failure Characterization")
-        self.resize(1280, 860)
+        self.resize(1100, 720)
 
         style = os.path.join(os.path.dirname(__file__), "styles.qss")
         if os.path.exists(style):
@@ -788,6 +950,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.splash.requestTrain.connect(self.start_training)
         self.splash.requestLoadTrained.connect(self.load_trained)
+
         self.training.cancelRequested.connect(self.to_splash)
         self.dashboard.requestModify.connect(self.to_splash)
 
@@ -821,6 +984,13 @@ class MainWindow(QtWidgets.QMainWindow):
 def main():
     app = QtWidgets.QApplication(sys.argv)
     app.setApplicationName("Cisco Silicon Failure Characterization")
+
+    # Optional font fallback to avoid missing Inter warnings (safe even if you keep QSS)
+    font = QtGui.QFont("Inter")
+    if not QtGui.QFontInfo(font).exactMatch():
+        font = QtGui.QFont("Helvetica Neue")
+    app.setFont(font)
+
     w = MainWindow()
     w.show()
     sys.exit(app.exec())

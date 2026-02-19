@@ -14,6 +14,106 @@ from sklearn.metrics import (
 from sklearn.preprocessing import LabelEncoder
 from sklearn.preprocessing import label_binarize
 
+import re
+
+_ID_NAME_RE = re.compile(
+    r"(serial|serno|s/n|sn\b|lot|wafer|unit|device|die|barcode|uuid|guid|hash|mac|imei|imsi|ip\b|hostname|name\b|id\b|identifier|index)",
+    re.IGNORECASE,
+)
+
+_DATE_NAME_RE = re.compile(r"(date|time|timestamp|datetime)", re.IGNORECASE)
+
+
+def _weak_non_measurement_candidates(df: pd.DataFrame) -> list[str]:
+    """
+    Conservative heuristic:
+    - Drop obvious identifier columns by name (serial, lot, uuid, etc.)
+    - Drop columns that are *mostly unique* AND are non-numeric strings (typical IDs)
+    - Drop obvious datetime columns
+    Do NOT drop numeric columns unless they have an obvious ID-like name.
+    """
+    n = len(df)
+    if n == 0:
+        return []
+
+    candidates: set[str] = set()
+
+    for c in df.columns:
+        name = str(c)
+
+        # Name-based: very high confidence
+        if _ID_NAME_RE.search(name):
+            candidates.add(c)
+            continue
+
+        if _DATE_NAME_RE.search(name):
+            candidates.add(c)
+            continue
+
+        s = df[c]
+
+        # Datetime dtype -> metadata
+        if pd.api.types.is_datetime64_any_dtype(s):
+            candidates.add(c)
+            continue
+
+        # Object-like columns that look like IDs:
+        # mostly unique + mostly non-numeric => likely ID string
+        if pd.api.types.is_object_dtype(s) or pd.api.types.is_string_dtype(s):
+            non_null = s.dropna()
+            if len(non_null) < max(10, int(0.1 * n)):
+                # too sparse, don't decide
+                continue
+
+            # uniqueness ratio
+            uniq_ratio = non_null.nunique(dropna=True) / max(1, len(non_null))
+
+            # fraction of values that can be parsed as numbers
+            num_parse = pd.to_numeric(non_null, errors="coerce")
+            numericish_ratio = float(num_parse.notna().mean())
+
+            # If it's mostly unique AND mostly not numeric => likely an ID
+            if uniq_ratio > 0.95 and numericish_ratio < 0.20:
+                candidates.add(c)
+                continue
+
+    return sorted(candidates)
+
+
+def _apply_exclusions_for_training(
+    df: pd.DataFrame,
+    target_col: str,
+    recommended_targets: list[str] | None = None,
+    explicit_excludes: list[str] | None = None,
+) -> tuple[pd.DataFrame, dict]:
+    """
+    Drops safe-to-drop non-measurement columns *from features* while preserving the chosen target.
+    Returns (df_filtered, meta_debug).
+    """
+    recommended_targets = recommended_targets or []
+    explicit_excludes = explicit_excludes or []
+
+    weak_meta = _weak_non_measurement_candidates(df)
+
+    # Exclude all recommended targets except the selected one
+    rec_excludes = [
+        c for c in recommended_targets if c in df.columns and c != target_col
+    ]
+
+    # Combine drops (but never drop the chosen target)
+    drop_cols = set(weak_meta) | set(rec_excludes) | set(explicit_excludes)
+    drop_cols.discard(target_col)
+
+    df2 = df.drop(columns=[c for c in drop_cols if c in df.columns], errors="ignore")
+
+    meta = {
+        "dropped_weak_non_measurement": weak_meta,
+        "dropped_recommended_targets": rec_excludes,
+        "dropped_explicit": [c for c in explicit_excludes if c in df.columns],
+        "total_dropped": len([c for c in drop_cols if c in df.columns]),
+    }
+    return df2, meta
+
 
 # -------------------------
 # Data loading
@@ -341,7 +441,12 @@ def _train_catboost(X: pd.DataFrame, y: pd.Series, cfg: dict):
     acc = accuracy_score(y_test, y_pred)
     f1w = f1_score(y_test, y_pred, average="weighted")
     cm = confusion_matrix(y_test, y_pred, labels=[str(c) for c in model.classes_])
-    report_text = classification_report(y_test, y_pred)
+    report_dict = classification_report(
+        y_test, y_pred, output_dict=True, zero_division=0
+    )
+    report_text = classification_report(
+        y_test, y_pred, zero_division=0
+    )
 
     # bins (use model.classes_ order)
     bin_names = [str(c) for c in model.classes_]
@@ -378,7 +483,8 @@ def _train_catboost(X: pd.DataFrame, y: pd.Series, cfg: dict):
         "model_name": "CatBoostClassifier",
         "metrics": {"Accuracy": float(acc), "F1_weighted": float(f1w)},
         "confusion_matrix": cm,
-        "classification_report": report_text,
+        "classification_report": report_dict,
+        "classification_report_text": report_text,
         "feature_importance": fi_df,
         "roc": roc_list,
         "bins": bins_df,
@@ -489,7 +595,12 @@ def _train_xgboost(X: pd.DataFrame, y: pd.Series, cfg: dict):
     acc = accuracy_score(y_test_labels, y_pred_labels)
     f1w = f1_score(y_test_labels, y_pred_labels, average="weighted")
     cm = confusion_matrix(y_test_labels, y_pred_labels, labels=class_names)
-    report_text = classification_report(y_test_labels, y_pred_labels)
+    report_dict = classification_report(
+        y_test_labels, y_pred_labels, output_dict=True, zero_division=0
+    )
+    report_text = classification_report(
+        y_test_labels, y_pred_labels, zero_division=0
+    )
 
     # bins
     counts = (
@@ -533,7 +644,8 @@ def _train_xgboost(X: pd.DataFrame, y: pd.Series, cfg: dict):
         "model_name": "XGBClassifier",
         "metrics": {"Accuracy": float(acc), "F1_weighted": float(f1w)},
         "confusion_matrix": cm,
-        "classification_report": report_text,
+        "classification_report": report_dict,
+        "classification_report_text": report_text,
         "feature_importance": fi_df,
         "roc": roc_list,
         "bins": bins_df,
@@ -546,51 +658,95 @@ def _train_xgboost(X: pd.DataFrame, y: pd.Series, cfg: dict):
 # Public entrypoint
 # -------------------------
 def run_analysis(data_path: str, cfg: dict) -> dict:
-    model_type = (cfg.get("model_type") or "").strip()
-    target_col = (cfg.get("target_column") or "").strip()
-    if not target_col:
-        raise ValueError("No target_column provided in config.")
+    """
+    End-to-end entrypoint called by the GUI worker.
 
+    Responsibilities:
+      - Load CSV/Parquet
+      - Validate/choose target column (GUI should provide cfg["target_column"])
+      - Apply conservative exclusion to avoid training on non-measurement metadata
+        (IDs/serials, datetime, and other "recommended target" columns)
+      - Train chosen model (CatBoost or XGBoost)
+      - Build payload for GUI (metrics, bins, roc, shap_importance, etc.)
+
+    Expected cfg keys (most are optional):
+      - model_type: "CatBoost" | "XGBoost"
+      - use_gpu: bool
+      - target_column: str   (required)
+      - recommended_targets: list[str]  (optional; from GUI suggestions)
+      - exclude_columns: list[str]      (optional; explicit drops)
+      - test_size, random_state, iterations, learning_rate, depth, etc.
+    """
+    cfg = cfg or {}
+    model_type = str(cfg.get("model_type", "XGBoost")).strip()
+    use_gpu = bool(cfg.get("use_gpu", True))
+
+    # --- Load data
     df = _load_df(data_path)
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        raise ValueError("Loaded dataset is empty or invalid.")
 
-    # SAFE mild drop only
-    df2 = _drop_obvious_id_columns(df, target_col)
-
-    df2 = _apply_feature_excludes(df2, target_col, cfg.get("exclude_columns", []))
-
-    X, y = _split_features(df2, target_col)
-
-    # Train
-    if model_type == "CatBoost":
-        trained = _train_catboost(X, y, cfg)
-    elif model_type == "XGBoost":
-        trained = _train_xgboost(X, y, cfg)
-    else:
+    # --- Validate target column
+    target_col = cfg.get("target_column")
+    if not target_col or target_col not in df.columns:
         raise ValueError(
-            f"Unknown model_type '{model_type}'. Choose CatBoost or XGBoost."
+            f"Target column '{target_col}' not found. Available columns: {list(df.columns)[:50]}"
         )
 
-    # Pack result in the format your GUI expects
-    preview_df = df2.head(300).copy()
+    # --- Conservative exclusion: don't train on non-measurement/metadata
+    recommended_targets = cfg.get("recommended_targets", []) or []
+    explicit_excludes = cfg.get("exclude_columns", []) or []
 
-    meta = {
-        "model": trained["model_name"],
-        "target_column": target_col,
-        "num_classes": int(len(trained.get("class_names", []))),
-    }
+    df_filtered, drop_meta = _apply_exclusions_for_training(
+        df=df,
+        target_col=target_col,
+        recommended_targets=recommended_targets,
+        explicit_excludes=explicit_excludes,
+    )
 
-    artifacts = {
-        "log": trained.get("classification_report", ""),
-    }
+    # --- Split features/target
+    X, y = _split_features(df_filtered, target_col)
 
-    return {
-        "meta": meta,
-        "metrics": trained.get("metrics", {}),
-        "bins": trained.get("bins", pd.DataFrame()),
-        "roc": trained.get("roc", []),
-        "confusion_matrix": trained.get("confusion_matrix", None),
-        "feature_importance": trained.get("feature_importance", pd.DataFrame()),
-        "shap_importance": trained.get("shap_importance", {}),
-        "artifacts": artifacts,
-        "dataframe": preview_df,
-    }
+    # Basic sanity
+    y_series = pd.Series(y).astype(str)
+    class_names = sorted(y_series.dropna().unique().tolist())
+    if len(class_names) < 2:
+        raise ValueError(
+            f"Target '{target_col}' must have at least 2 unique values. Found: {class_names}"
+        )
+
+    # --- Train model
+    if model_type.lower() == "catboost":
+        results = _train_catboost(X, y_series, {**cfg, "use_gpu": use_gpu})
+        model_name = "CatBoostClassifier"
+    elif model_type.lower() == "xgboost":
+        results = _train_xgboost(X, y_series, {**cfg, "use_gpu": use_gpu})
+        model_name = "XGBClassifier"
+    else:
+        raise ValueError("model_type must be 'CatBoost' or 'XGBoost'")
+
+    # --- Attach common metadata + dataframe preview for GUI
+    meta = results.get("meta", {}) or {}
+    meta.update(
+        {
+            "model": model_name,
+            "model_type": model_type,
+            "use_gpu_requested": use_gpu,
+            "target_column": target_col,
+            "num_classes": len(class_names),
+            "classes": class_names,
+            "data_path": data_path,
+            "n_rows": int(df.shape[0]),
+            "n_cols_original": int(df.shape[1]),
+            "n_cols_after_filter": int(df_filtered.shape[1]),
+            "dropped_columns_info": drop_meta,
+        }
+    )
+    results["meta"] = meta
+
+    # Provide a dataframe for the Data Table tab (cap columns if needed)
+    # Keep original columns (helps users inspect), but it's fine to show filtered too.
+    # We'll show filtered to match training set, plus the target.
+    results["dataframe"] = df_filtered.copy()
+
+    return results
