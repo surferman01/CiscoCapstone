@@ -709,8 +709,8 @@ class ChartCard(QtWidgets.QGroupBox):
         self.ax = self.canvas.figure.add_subplot(111)
         self.layout().addWidget(self.canvas)
 
-        self.setMinimumHeight(height)
-        self.setMaximumHeight(height)
+        self.setMinimumHeight(max(180, int(height * 0.7)))
+        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
 
 
 # -----------------------------
@@ -754,8 +754,9 @@ class DashboardTabs(QtWidgets.QTabWidget):
 
         kpi_wrap = QtWidgets.QWidget()
         kpi_wrap.setLayout(kpi_row)
-        kpi_wrap.setMinimumHeight(130)
-        kpi_wrap.setMaximumHeight(140)
+        kpi_wrap.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred
+        )
         d.addWidget(kpi_wrap)
 
         self.ovBar = ChartCard("Class Distribution (Test)", height=250)
@@ -779,13 +780,15 @@ class DashboardTabs(QtWidgets.QTabWidget):
 
         charts_wrap = QtWidgets.QWidget()
         charts_wrap.setLayout(charts_grid)
-        charts_wrap.setMinimumHeight(530)
-        charts_wrap.setMaximumHeight(530)
+        charts_wrap.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding
+        )
         d.addWidget(charts_wrap)
 
         self.perClassCard = QtWidgets.QGroupBox("Per-Class Metrics")
-        self.perClassCard.setMinimumHeight(220)
-        self.perClassCard.setMaximumHeight(240)
+        self.perClassCard.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred
+        )
         per_v = QtWidgets.QVBoxLayout(self.perClassCard)
         self.perClassTable = QtWidgets.QTableWidget()
         self.perClassTable.setColumnCount(5)
@@ -1283,7 +1286,15 @@ class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("Cisco Silicon Failure Characterization")
-        self.resize(1100, 720)
+        screen = QtGui.QGuiApplication.primaryScreen()
+        if screen is not None:
+            avail = screen.availableGeometry()
+            w = min(1100, max(720, int(avail.width() * 0.92)))
+            h = min(720, max(560, int(avail.height() * 0.88)))
+            self.resize(w, h)
+        else:
+            self.resize(1000, 680)
+        self.setMinimumSize(680, 500)
 
         base_dir = os.path.dirname(__file__)
         self.theme_files = {
