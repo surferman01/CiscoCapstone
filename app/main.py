@@ -9,12 +9,12 @@ from PySide6.QtCore import Qt, Signal, Slot, QThreadPool, QRunnable, QObject
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 
-from analysis import run_analysis
+from analysis import run_analysis, run_analysis_with_artifact, save_model_artifact
 from widgets import DropZone, ClickTile
 
 
 # -----------------------------
-# Weak (safe) metadata detection
+# Weak (safe) metadata detection (UI-side suggestions)
 # -----------------------------
 _ID_NAME_RE = re.compile(
     r"(serial|serno|s/n|sn\b|lot|wafer|unit|device|die|barcode|uuid|guid|hash|mac|imei|imsi|ip\b|hostname|name\b|id\b|identifier|index)",
@@ -24,18 +24,11 @@ _DATE_NAME_RE = re.compile(r"(date|time|timestamp|datetime)", re.IGNORECASE)
 
 
 def suggest_drop_columns_weak(df: pd.DataFrame) -> list[str]:
-    """
-    Conservative suggestions:
-      - obvious ID/date columns by name
-      - datetime dtype
-      - mostly-unique string columns that are mostly non-numeric (typical IDs)
-    """
     n = len(df)
     if n == 0:
         return []
 
     drops = set()
-
     for c in df.columns:
         name = str(c)
 
@@ -58,7 +51,6 @@ def suggest_drop_columns_weak(df: pd.DataFrame) -> list[str]:
             num_parse = pd.to_numeric(non_null, errors="coerce")
             numericish_ratio = float(num_parse.notna().mean())
 
-            # mostly unique string-like AND mostly non-numeric => likely identifier
             if uniq_ratio > 0.95 and numericish_ratio < 0.20:
                 drops.add(c)
 
@@ -69,10 +61,6 @@ def suggest_drop_columns_weak(df: pd.DataFrame) -> list[str]:
 # Column drop selection dialog
 # -----------------------------
 class ColumnDropDialog(QtWidgets.QDialog):
-    """
-    Checklist dialog: checked columns will be excluded from model training features.
-    """
-
     def __init__(self, parent, all_columns: list[str], prechecked: set[str]):
         super().__init__(parent)
         self.setWindowTitle("Review columns to exclude from training")
@@ -87,12 +75,10 @@ class ColumnDropDialog(QtWidgets.QDialog):
         info.setWordWrap(True)
         root.addWidget(info)
 
-        # Search
         self.search = QtWidgets.QLineEdit()
         self.search.setPlaceholderText("Search columns…")
         root.addWidget(self.search)
 
-        # List
         self.list = QtWidgets.QListWidget()
         self.list.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
         root.addWidget(self.list, stretch=1)
@@ -103,7 +89,6 @@ class ColumnDropDialog(QtWidgets.QDialog):
             item.setCheckState(Qt.Checked if c in prechecked else Qt.Unchecked)
             self.list.addItem(item)
 
-        # Quick actions
         btn_row = QtWidgets.QHBoxLayout()
         self.checkAllBtn = QtWidgets.QPushButton("Check all")
         self.uncheckAllBtn = QtWidgets.QPushButton("Uncheck all")
@@ -112,7 +97,6 @@ class ColumnDropDialog(QtWidgets.QDialog):
         btn_row.addStretch(1)
         root.addLayout(btn_row)
 
-        # OK/Cancel
         buttons = QtWidgets.QDialogButtonBox(
             QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
         )
@@ -120,7 +104,6 @@ class ColumnDropDialog(QtWidgets.QDialog):
 
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
-
         self.checkAllBtn.clicked.connect(self._check_all)
         self.uncheckAllBtn.clicked.connect(self._uncheck_all)
         self.search.textChanged.connect(self._filter)
@@ -175,11 +158,6 @@ class PandasModel(QtCore.QAbstractTableModel):
             return None
         return str(self._df.columns[s]) if orient == Qt.Horizontal else str(s)
 
-    def set(self, df):
-        self.beginResetModel()
-        self._df = df
-        self.endResetModel()
-
 
 # -----------------------------
 # Worker / ThreadPool
@@ -206,6 +184,23 @@ class TrainWorker(QRunnable):
             self.signals.finished.emit(e)
 
 
+class AnalyzeWorker(QRunnable):
+    def __init__(self, data_path: str, artifact_path: str):
+        super().__init__()
+        self.data_path = data_path
+        self.artifact_path = artifact_path
+        self.signals = WorkerSignals()
+
+    @QtCore.Slot()
+    def run(self):
+        try:
+            self.signals.status.emit("Running analysis with saved model...")
+            res = run_analysis_with_artifact(self.data_path, self.artifact_path, {})
+            self.signals.finished.emit(res)
+        except Exception as e:
+            self.signals.finished.emit(e)
+
+
 # -----------------------------
 # Splash Page
 # -----------------------------
@@ -217,7 +212,6 @@ class SplashPage(QtWidgets.QWidget):
         super().__init__()
         layout = QtWidgets.QVBoxLayout(self)
 
-        # Title + logo
         title = QtWidgets.QLabel("Cisco Silicon Failure Characterization")
         title.setObjectName("titleBar")
         title.setAlignment(Qt.AlignCenter)
@@ -233,7 +227,6 @@ class SplashPage(QtWidgets.QWidget):
             logo.setText("cisco")
         layout.addWidget(logo)
 
-        # --- Three equal columns
         columns = QtWidgets.QHBoxLayout()
         columns.setSpacing(18)
         layout.addLayout(columns, stretch=1)
@@ -368,12 +361,8 @@ class SplashPage(QtWidgets.QWidget):
         self._update_train_enabled()
 
     def _recommend_targets(self, df: pd.DataFrame, max_cols: int = 10) -> list[str]:
-        """
-        Similar to your snippet:
-          - columns that are not fully numeric are good target candidates
-          - also include low-cardinality numeric columns as secondary
-        """
         candidates = []
+        # non-fully-numeric columns
         for c in df.columns:
             s = df[c]
             if s.dropna().empty:
@@ -382,6 +371,7 @@ class SplashPage(QtWidgets.QWidget):
             if not all_numeric:
                 candidates.append(c)
 
+        # low-cardinality numeric columns
         for c in df.columns:
             if c in candidates:
                 continue
@@ -398,7 +388,6 @@ class SplashPage(QtWidgets.QWidget):
         self.data_path = path
         self.selectedLabel.setText(f"Selected: {os.path.basename(path)}")
 
-        # Parse preview to populate targets + drop suggestions
         try:
             if path.lower().endswith(".csv"):
                 df_preview = pd.read_csv(path, nrows=5000)
@@ -407,7 +396,6 @@ class SplashPage(QtWidgets.QWidget):
 
             self.all_columns = list(df_preview.columns)
 
-            # Recommended targets for target selection
             recs = self._recommend_targets(df_preview)
             self.recommended_targets = recs[:]
 
@@ -426,7 +414,6 @@ class SplashPage(QtWidgets.QWidget):
                 )
             self.targetCombo.blockSignals(False)
 
-            # Suggested metadata drops (weak filter)
             self.suggested_drop_cols = suggest_drop_columns_weak(df_preview)
             self.user_drop_cols = list(self.suggested_drop_cols)
 
@@ -449,12 +436,13 @@ class SplashPage(QtWidgets.QWidget):
     def _on_review_drops(self):
         if not self.all_columns:
             return
-
         prechecked = set(self.user_drop_cols or self.suggested_drop_cols or [])
         dlg = ColumnDropDialog(self, self.all_columns, prechecked)
         if dlg.exec() == QtWidgets.QDialog.Accepted:
             self.user_drop_cols = dlg.selected_drops()
-            self.dropSummary.setText(f"Drop columns: {len(self.user_drop_cols)} (customized)")
+            self.dropSummary.setText(
+                f"Drop columns: {len(self.user_drop_cols)} (customized)"
+            )
 
     def _on_file_dropped(self, path: str):
         if path:
@@ -477,7 +465,9 @@ class SplashPage(QtWidgets.QWidget):
 
     def _on_train_click(self):
         if not self.data_path:
-            QtWidgets.QMessageBox.information(self, "No data", "Choose a dataset first.")
+            QtWidgets.QMessageBox.information(
+                self, "No data", "Choose a dataset first."
+            )
             return
 
         model_type = self.combo.currentText()
@@ -494,7 +484,7 @@ class SplashPage(QtWidgets.QWidget):
             )
             return
 
-        # quick validation (fast preview)
+        # quick validation (preview)
         try:
             if self.data_path.lower().endswith(".csv"):
                 df_check = pd.read_csv(self.data_path, nrows=5000)
@@ -503,13 +493,17 @@ class SplashPage(QtWidgets.QWidget):
 
             if target_col not in df_check.columns:
                 QtWidgets.QMessageBox.critical(
-                    self, "Invalid target", f"Column '{target_col}' not found in dataset."
+                    self,
+                    "Invalid target",
+                    f"Column '{target_col}' not found in dataset.",
                 )
                 return
 
             if df_check[target_col].dropna().nunique() < 2:
                 QtWidgets.QMessageBox.critical(
-                    self, "Invalid target", f"Target '{target_col}' has < 2 unique values."
+                    self,
+                    "Invalid target",
+                    f"Target '{target_col}' has < 2 unique values.",
                 )
                 return
 
@@ -520,10 +514,10 @@ class SplashPage(QtWidgets.QWidget):
         recs = list(self.recommended_targets or [])
         user_drops = list(self.user_drop_cols or [])
 
-        # Always exclude other recommended targets (except the chosen target)
+        # Always exclude other recommended targets (except chosen target)
         rec_excludes = [c for c in recs if c != target_col]
 
-        # Merge & never drop chosen target
+        # Merge + never drop chosen target
         exclude_cols = sorted(set(user_drops) | set(rec_excludes))
         exclude_cols = [c for c in exclude_cols if c != target_col]
 
@@ -531,28 +525,15 @@ class SplashPage(QtWidgets.QWidget):
             "model_type": model_type,
             "use_gpu": self.gpuCheck.isChecked(),
             "target_column": target_col,
-
-            # analysis.py can use this for additional safe exclusion/reporting
             "recommended_targets": recs,
-
-            # final per-run exclusions (UI-controlled)
             "exclude_columns": exclude_cols,
         }
-
-        # Optional small confirmation (comment out if you don't want popups)
-        # preview = "\n".join(exclude_cols[:25])
-        # more = "" if len(exclude_cols) <= 25 else f"\n… (+{len(exclude_cols)-25} more)"
-        # QtWidgets.QMessageBox.information(
-        #     self,
-        #     "Training exclusions",
-        #     f"Excluding {len(exclude_cols)} columns from training features.\n\n{preview}{more}",
-        # )
 
         self.requestTrain.emit(self.data_path, config)
 
     def _on_load_trained_clicked(self):
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Open trained artifact", "", "Pickle/Model Files (*.*)"
+            self, "Open trained artifact", "", "Model Artifact (*.pkl);;All Files (*.*)"
         )
         if path:
             self.modelLabel.setText(f"Selected: {os.path.basename(path)}")
@@ -568,14 +549,16 @@ class TrainingPage(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
         layout = QtWidgets.QVBoxLayout(self)
-        title = QtWidgets.QLabel("Cisco Silicon Failure Characterization", alignment=Qt.AlignCenter)
+        title = QtWidgets.QLabel(
+            "Cisco Silicon Failure Characterization", alignment=Qt.AlignCenter
+        )
         title.setObjectName("titleBar")
         layout.addWidget(title)
 
         center = QtWidgets.QVBoxLayout()
-        msg = QtWidgets.QLabel("Training your data...", alignment=Qt.AlignCenter)
+        msg = QtWidgets.QLabel("Training / Analyzing...", alignment=Qt.AlignCenter)
         f = msg.font()
-        f.setPointSize(28)
+        f.setPointSize(26)
         msg.setFont(f)
         center.addWidget(msg, alignment=Qt.AlignCenter)
 
@@ -628,12 +611,12 @@ class ChartCard(QtWidgets.QGroupBox):
         self.layout().setSpacing(8)
 
         self.canvas = FigureCanvas(Figure(figsize=(6, 3), dpi=100))
-        self.canvas.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
+        self.canvas.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding
+        )
         self.ax = self.canvas.figure.add_subplot(111)
-
         self.layout().addWidget(self.canvas)
 
-        # fixed card height so charts don't stretch to fill the entire page
         self.setMinimumHeight(height)
         self.setMaximumHeight(height)
 
@@ -653,7 +636,7 @@ class DashboardTabs(QtWidgets.QTabWidget):
         self.addTab(self.tablePage, "Data Table")
         self.addTab(self.fiPage, "Feature Importance")
 
-        # Dashboard tab (no scroll; fixed-size KPIs and charts)
+        # Dashboard tab
         d = QtWidgets.QVBoxLayout(self.dashboard)
         d.setContentsMargins(12, 12, 12, 12)
         d.setSpacing(16)
@@ -664,11 +647,10 @@ class DashboardTabs(QtWidgets.QTabWidget):
         self.kpiAccuracy = KPIBox("Accuracy")
         self.kpiPrecision = KPIBox("Precision (w)")
         self.kpiRecall = KPIBox("Recall (w)")
-        self.kpiF1 = KPIBox("F1 (weighted)")
+        self.kpiF1 = KPIBox("F1 (w)")
         self.kpiModel = KPIBox("Model")
         self.kpiTarget = KPIBox("Target")
         self.kpiClasses = KPIBox("Classes")
-
 
         kpi_row.addWidget(self.kpiAccuracy, 1)
         kpi_row.addWidget(self.kpiPrecision, 1)
@@ -677,7 +659,6 @@ class DashboardTabs(QtWidgets.QTabWidget):
         kpi_row.addWidget(self.kpiModel, 1)
         kpi_row.addWidget(self.kpiTarget, 1)
         kpi_row.addWidget(self.kpiClasses, 1)
-
 
         kpi_wrap = QtWidgets.QWidget()
         kpi_wrap.setLayout(kpi_row)
@@ -704,7 +685,6 @@ class DashboardTabs(QtWidgets.QTabWidget):
         # Data Table tab
         tl = QtWidgets.QVBoxLayout(self.tablePage)
         tl.setContentsMargins(12, 12, 12, 12)
-
         self.table = QtWidgets.QTableView()
         self.table.setSortingEnabled(True)
         self.table.setAlternatingRowColors(True)
@@ -727,7 +707,9 @@ class DashboardTabs(QtWidgets.QTabWidget):
         fl.setContentsMargins(12, 12, 12, 12)
         fl.setSpacing(12)
 
-        self.fiHeader = QtWidgets.QLabel("Top 20 features by SHAP (one table per class/bin).")
+        self.fiHeader = QtWidgets.QLabel(
+            "Top 20 features by SHAP (one table per class/bin)."
+        )
         self.fiHeader.setWordWrap(True)
         fl.addWidget(self.fiHeader)
 
@@ -742,15 +724,15 @@ class DashboardTabs(QtWidgets.QTabWidget):
     def _clear_layout(self, layout: QtWidgets.QLayout):
         while layout.count():
             item = layout.takeAt(0)
-            widget = item.widget()
-            child_layout = item.layout()
-            if widget:
-                widget.deleteLater()
-            elif child_layout:
-                self._clear_layout(child_layout)
+            w = item.widget()
+            child = item.layout()
+            if w:
+                w.deleteLater()
+            elif child:
+                self._clear_layout(child)
 
     def populate(self, results: dict):
-        # Data table
+        # Table
         df = results.get("dataframe", pd.DataFrame())
         self.table.setModel(PandasModel(df))
 
@@ -761,46 +743,44 @@ class DashboardTabs(QtWidgets.QTabWidget):
 
         # KPIs
         self.kpiAccuracy.value.setText(
-            f"{float(metrics.get('Accuracy', 0.0)):.4f}" if "Accuracy" in metrics else "—"
+            f"{float(metrics.get('Accuracy', 0.0)):.4f}"
+            if "Accuracy" in metrics
+            else "—"
         )
-        # Precision/Recall (weighted) – best source is classification_report dict if present
-        prec_w = None
-        rec_w = None
-
-        report = results.get("classification_report")
-        if isinstance(report, dict):
-            wavg = report.get("weighted avg") or {}
-            if isinstance(wavg, dict):
-                prec_w = wavg.get("precision")
-                rec_w = wavg.get("recall")
-
-        # fallback: allow metrics dict to supply these later if you add them in analysis.py
-        if prec_w is None:
-            prec_w = metrics.get("Precision_weighted")
-        if rec_w is None:
-            rec_w = metrics.get("Recall_weighted")
-
-        self.kpiPrecision.value.setText(f"{float(prec_w):.4f}" if prec_w is not None else "—")
-        self.kpiRecall.value.setText(f"{float(rec_w):.4f}" if rec_w is not None else "—")
-
+        self.kpiPrecision.value.setText(
+            f"{float(metrics.get('Precision_weighted', 0.0)):.4f}"
+            if "Precision_weighted" in metrics
+            else "—"
+        )
+        self.kpiRecall.value.setText(
+            f"{float(metrics.get('Recall_weighted', 0.0)):.4f}"
+            if "Recall_weighted" in metrics
+            else "—"
+        )
         self.kpiF1.value.setText(
-            f"{float(metrics.get('F1_weighted', 0.0)):.4f}" if "F1_weighted" in metrics else "—"
+            f"{float(metrics.get('F1_weighted', 0.0)):.4f}"
+            if "F1_weighted" in metrics
+            else "—"
         )
         self.kpiModel.value.setText(str(meta.get("model", meta.get("model_name", "—"))))
-        self.kpiTarget.value.setText(str(meta.get("target_column", meta.get("target", "—"))))
-        self.kpiClasses.value.setText(str(meta.get("num_classes", meta.get("classes", "—"))))
+        self.kpiTarget.value.setText(str(meta.get("target_column", "—")))
+        self.kpiClasses.value.setText(str(meta.get("num_classes", "—")))
 
         # Class distribution
         ax = self.ovBar.ax
         ax.clear()
-        if isinstance(bins, pd.DataFrame) and not bins.empty and {"bin_name", "count"}.issubset(bins.columns):
+        if (
+            isinstance(bins, pd.DataFrame)
+            and not bins.empty
+            and {"bin_name", "count"}.issubset(bins.columns)
+        ):
             ax.bar(bins["bin_name"].astype(str), bins["count"])
             ax.set_xlabel("Class")
             ax.set_ylabel("Count")
         self.ovBar.canvas.figure.tight_layout()
         self.ovBar.canvas.draw()
 
-        # ROC preview
+        # ROC
         ax = self.ovRoc.ax
         ax.clear()
         for r in roc_list[:3]:
@@ -816,15 +796,18 @@ class DashboardTabs(QtWidgets.QTabWidget):
         # Feature importance tables
         self._clear_layout(self.fiTablesLayout)
         shap_importance = results.get("shap_importance", {}) or {}
-
         if not isinstance(shap_importance, dict) or not shap_importance:
             msg = QtWidgets.QLabel("No per-class feature importance available.")
             msg.setStyleSheet("color:#666;")
             self.fiTablesLayout.addWidget(msg, 0, 0)
             return
 
-        # Prefer ordering from bins
-        if isinstance(bins, pd.DataFrame) and not bins.empty and "bin_name" in bins.columns:
+        # order by bins if possible
+        if (
+            isinstance(bins, pd.DataFrame)
+            and not bins.empty
+            and "bin_name" in bins.columns
+        ):
             class_list = [str(x) for x in bins["bin_name"].tolist()]
         else:
             class_list = [str(k) for k in shap_importance.keys()]
@@ -836,7 +819,6 @@ class DashboardTabs(QtWidgets.QTabWidget):
             df_cls = shap_importance.get(cls_name)
             if df_cls is None:
                 df_cls = shap_importance.get(str(cls_name).strip().lower())
-
             if not (isinstance(df_cls, pd.DataFrame) and not df_cls.empty):
                 continue
 
@@ -847,7 +829,16 @@ class DashboardTabs(QtWidgets.QTabWidget):
             table.setMinimumHeight(630)
             table.setColumnCount(8)
             table.setHorizontalHeaderLabels(
-                ["Rank", "Feature", "SHAP |Δ|", "Share (%)", "Direction", "Failure Avg", "PASS Avg", "PASS Std"]
+                [
+                    "Rank",
+                    "Feature",
+                    "SHAP |Δ|",
+                    "Share (%)",
+                    "Direction",
+                    "Failure Avg",
+                    "PASS/Other Avg",
+                    "PASS/Other Std",
+                ]
             )
             table.verticalHeader().setVisible(False)
             table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
@@ -861,19 +852,59 @@ class DashboardTabs(QtWidgets.QTabWidget):
             table.setRowCount(len(top))
 
             for r, row in top.iterrows():
-                table.setItem(r, 0, QtWidgets.QTableWidgetItem(str(int(row.get("rank", r + 1)))))
-                table.setItem(r, 1, QtWidgets.QTableWidgetItem(str(row.get("feature", ""))))
-                table.setItem(r, 2, QtWidgets.QTableWidgetItem(f"{float(row.get('importance', 0.0)):.4f}"))
-                table.setItem(r, 3, QtWidgets.QTableWidgetItem(f"{float(row.get('share_pct', 0.0)):.1f}"))
-                table.setItem(r, 4, QtWidgets.QTableWidgetItem(f"{float(row.get('direction', 0.0)):.4f}"))
+                table.setItem(
+                    r, 0, QtWidgets.QTableWidgetItem(str(int(row.get("rank", r + 1))))
+                )
+                table.setItem(
+                    r, 1, QtWidgets.QTableWidgetItem(str(row.get("feature", "")))
+                )
+                table.setItem(
+                    r,
+                    2,
+                    QtWidgets.QTableWidgetItem(
+                        f"{float(row.get('importance', 0.0)):.4f}"
+                    ),
+                )
+                table.setItem(
+                    r,
+                    3,
+                    QtWidgets.QTableWidgetItem(
+                        f"{float(row.get('share_pct', 0.0)):.1f}"
+                    ),
+                )
+                table.setItem(
+                    r,
+                    4,
+                    QtWidgets.QTableWidgetItem(
+                        f"{float(row.get('direction', 0.0)):.4f}"
+                    ),
+                )
 
                 fa = row.get("failure_avg")
                 pa = row.get("pass_avg")
                 ps = row.get("pass_std")
 
-                table.setItem(r, 5, QtWidgets.QTableWidgetItem("" if pd.isna(fa) else f"{float(fa):.4f}"))
-                table.setItem(r, 6, QtWidgets.QTableWidgetItem("" if pd.isna(pa) else f"{float(pa):.4f}"))
-                table.setItem(r, 7, QtWidgets.QTableWidgetItem("" if pd.isna(ps) else f"{float(ps):.4f}"))
+                table.setItem(
+                    r,
+                    5,
+                    QtWidgets.QTableWidgetItem(
+                        "" if pd.isna(fa) else f"{float(fa):.4f}"
+                    ),
+                )
+                table.setItem(
+                    r,
+                    6,
+                    QtWidgets.QTableWidgetItem(
+                        "" if pd.isna(pa) else f"{float(pa):.4f}"
+                    ),
+                )
+                table.setItem(
+                    r,
+                    7,
+                    QtWidgets.QTableWidgetItem(
+                        "" if pd.isna(ps) else f"{float(ps):.4f}"
+                    ),
+                )
 
             vbox.addWidget(table)
 
@@ -884,7 +915,9 @@ class DashboardTabs(QtWidgets.QTabWidget):
             added += 1
 
         if added == 0:
-            msg = QtWidgets.QLabel("No per-class feature importance tables were generated.")
+            msg = QtWidgets.QLabel(
+                "No per-class feature importance tables were generated."
+            )
             msg.setStyleSheet("color:#666;")
             self.fiTablesLayout.addWidget(msg, 0, 0)
 
@@ -900,7 +933,9 @@ class DashboardPage(QtWidgets.QWidget):
         super().__init__()
         root = QtWidgets.QVBoxLayout(self)
 
-        title = QtWidgets.QLabel("Cisco Silicon Failure Characterization", alignment=Qt.AlignCenter)
+        title = QtWidgets.QLabel(
+            "Cisco Silicon Failure Characterization", alignment=Qt.AlignCenter
+        )
         title.setObjectName("titleBar")
         root.addWidget(title)
 
@@ -910,7 +945,7 @@ class DashboardPage(QtWidgets.QWidget):
         actions = QtWidgets.QHBoxLayout()
         self.modifyBtn = QtWidgets.QPushButton("modify data")
         self.modifyBtn.clicked.connect(lambda: self.requestModify.emit())
-        self.saveBtn = QtWidgets.QPushButton("save")
+        self.saveBtn = QtWidgets.QPushButton("save model")
         self.saveBtn.clicked.connect(lambda: self.requestSave.emit())
         actions.addStretch()
         actions.addWidget(self.modifyBtn)
@@ -947,12 +982,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.stack.addWidget(self.dashboard)
 
         self.threadpool = QThreadPool()
+        self.last_results = None
 
         self.splash.requestTrain.connect(self.start_training)
         self.splash.requestLoadTrained.connect(self.load_trained)
 
         self.training.cancelRequested.connect(self.to_splash)
         self.dashboard.requestModify.connect(self.to_splash)
+        self.dashboard.requestSave.connect(self.save_current_model)
 
     @Slot()
     def to_splash(self):
@@ -961,31 +998,67 @@ class MainWindow(QtWidgets.QMainWindow):
     def start_training(self, data_path: str, config: dict):
         self.stack.setCurrentIndex(1)
         worker = TrainWorker(data_path, config)
-        worker.signals.finished.connect(self._on_trained)
+        worker.signals.finished.connect(self._on_result_ready)
         worker.signals.status.connect(lambda s: self.statusBar().showMessage(s, 3000))
         self.threadpool.start(worker)
 
-    def _on_trained(self, payload):
+    def _on_result_ready(self, payload):
         if isinstance(payload, Exception):
             QtWidgets.QMessageBox.critical(self, "Error", f"{payload}")
             self.stack.setCurrentIndex(0)
             return
+
+        self.last_results = payload
         self.dashboard.populate(payload)
         self.stack.setCurrentIndex(2)
 
-    def load_trained(self, path: str):
-        QtWidgets.QMessageBox.information(
+    def save_current_model(self):
+        if not self.last_results or "artifact" not in self.last_results:
+            QtWidgets.QMessageBox.information(self, "No model", "Train a model first.")
+            return
+
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(
             self,
-            "Loaded",
-            f"Selected trained artifact: {os.path.basename(path)}\n(Wire this to restore a model.)",
+            "Save model artifact",
+            "",
+            "Model Artifact (*.pkl);;All Files (*.*)",
         )
+        if not path:
+            return
+        if not path.lower().endswith(".pkl"):
+            path += ".pkl"
+
+        try:
+            save_model_artifact(self.last_results["artifact"], path)
+            QtWidgets.QMessageBox.information(
+                self, "Saved", f"Saved model artifact:\n{path}"
+            )
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Save failed", str(e))
+
+    def load_trained(self, artifact_path: str):
+        # choose dataset to analyze without retraining
+        data_path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Choose dataset to analyze (no retrain)",
+            "",
+            "Data Files (*.csv *.parquet *.pq);;CSV (*.csv);;Parquet (*.parquet *.pq);;All Files (*.*)",
+        )
+        if not data_path:
+            return
+
+        self.stack.setCurrentIndex(1)
+        worker = AnalyzeWorker(data_path, artifact_path)
+        worker.signals.finished.connect(self._on_result_ready)
+        worker.signals.status.connect(lambda s: self.statusBar().showMessage(s, 3000))
+        self.threadpool.start(worker)
 
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
     app.setApplicationName("Cisco Silicon Failure Characterization")
 
-    # Optional font fallback to avoid missing Inter warnings (safe even if you keep QSS)
+    # Optional font fallback
     font = QtGui.QFont("Inter")
     if not QtGui.QFontInfo(font).exactMatch():
         font = QtGui.QFont("Helvetica Neue")
