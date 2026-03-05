@@ -709,8 +709,9 @@ class ChartCard(QtWidgets.QGroupBox):
         self.ax = self.canvas.figure.add_subplot(111)
         self.layout().addWidget(self.canvas)
 
-        self.setMinimumHeight(max(180, int(height * 0.7)))
-        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred)
+        self.setMinimumHeight(height)
+        self.setMaximumHeight(height)
+        self.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
 
 
 # -----------------------------
@@ -720,7 +721,13 @@ class DashboardTabs(QtWidgets.QTabWidget):
     def __init__(self):
         super().__init__()
 
-        self.dashboard = QtWidgets.QWidget()
+        self.dashboard = QtWidgets.QScrollArea()
+        self.dashboard.setWidgetResizable(True)
+        self.dashboard.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.dashboard.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+
+        dashboardInner = QtWidgets.QWidget()
+        self.dashboard.setWidget(dashboardInner)
         self.tablePage = QtWidgets.QWidget()
         self.fiPage = QtWidgets.QWidget()
 
@@ -729,7 +736,7 @@ class DashboardTabs(QtWidgets.QTabWidget):
         self.addTab(self.fiPage, "Feature Importance")
 
         # Dashboard tab
-        d = QtWidgets.QVBoxLayout(self.dashboard)
+        d = QtWidgets.QVBoxLayout(dashboardInner)
         d.setContentsMargins(12, 12, 12, 12)
         d.setSpacing(16)
 
@@ -754,9 +761,8 @@ class DashboardTabs(QtWidgets.QTabWidget):
 
         kpi_wrap = QtWidgets.QWidget()
         kpi_wrap.setLayout(kpi_row)
-        kpi_wrap.setSizePolicy(
-            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred
-        )
+        kpi_wrap.setMinimumHeight(130)
+        kpi_wrap.setMaximumHeight(140)
         d.addWidget(kpi_wrap)
 
         self.ovBar = ChartCard("Class Distribution (Test)", height=250)
@@ -780,15 +786,13 @@ class DashboardTabs(QtWidgets.QTabWidget):
 
         charts_wrap = QtWidgets.QWidget()
         charts_wrap.setLayout(charts_grid)
-        charts_wrap.setSizePolicy(
-            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding
-        )
+        charts_wrap.setMinimumHeight(530)
+        charts_wrap.setMaximumHeight(530)
         d.addWidget(charts_wrap)
 
         self.perClassCard = QtWidgets.QGroupBox("Per-Class Metrics")
-        self.perClassCard.setSizePolicy(
-            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Preferred
-        )
+        self.perClassCard.setMinimumHeight(220)
+        self.perClassCard.setMaximumHeight(240)
         per_v = QtWidgets.QVBoxLayout(self.perClassCard)
         self.perClassTable = QtWidgets.QTableWidget()
         self.perClassTable.setColumnCount(5)
