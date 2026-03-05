@@ -295,6 +295,168 @@ def _build_per_class_importance_tables(
     return out
 
 
+def _derive_pass_mask(y_labels: pd.Series) -> np.ndarray:
+    s = pd.Series(y_labels).astype(str)
+    upper = s.str.upper().str.strip()
+
+    pass_like = upper.str.contains("PASS", na=False)
+    if pass_like.any():
+        return pass_like.to_numpy()
+
+    fail_like = upper.str.contains("FAIL", na=False)
+    if fail_like.any():
+        return (~fail_like).to_numpy()
+
+    uniq = upper.dropna().unique().tolist()
+    if len(uniq) == 2:
+        pass_class = pd.Series(upper).value_counts().index[0]
+        return (upper == pass_class).to_numpy()
+
+    return np.zeros(len(s), dtype=bool)
+
+
+def _select_distribution_groups(y_labels: pd.Series, max_groups: int = 2) -> List[str]:
+    upper = pd.Series(y_labels).astype(str).str.upper().str.strip()
+    if upper.empty:
+        return []
+
+    is_pass_fail = upper.str.contains("PASS|FAIL", regex=True, na=False)
+    is_other = upper.str.contains("OTHER", na=False)
+    preferred = upper[~is_pass_fail & ~is_other]
+
+    counts = preferred.value_counts()
+    groups = counts.index.tolist()[:max_groups]
+    if len(groups) >= max_groups:
+        return groups
+
+    # Fallback: fill from all labels by frequency.
+    all_counts = upper.value_counts()
+    for g in all_counts.index.tolist():
+        if g not in groups:
+            groups.append(g)
+        if len(groups) >= max_groups:
+            break
+
+    return groups
+
+
+def _build_visual_plot_payload(
+    X_eval: pd.DataFrame,
+    y_true_labels: pd.Series,
+    y_prob: Optional[np.ndarray],
+    class_names: List[str],
+    shap_importance: Dict[str, pd.DataFrame],
+) -> Dict[str, Any]:
+    y_series = pd.Series(y_true_labels).astype(str).reset_index(drop=True)
+    pass_mask = _derive_pass_mask(y_series)
+
+    # Top 5 SHAP-ranked numeric features for PASS vs FAIL histograms
+    feature_scores: Dict[str, float] = {}
+    if isinstance(shap_importance, dict):
+        for _, df_imp in shap_importance.items():
+            if not isinstance(df_imp, pd.DataFrame) or df_imp.empty:
+                continue
+            use_cols = {"feature", "importance"}
+            if not use_cols.issubset(df_imp.columns):
+                continue
+            for _, row in df_imp[["feature", "importance"]].head(50).iterrows():
+                feat = str(row["feature"])
+                try:
+                    val = float(row["importance"])
+                except Exception:
+                    val = 0.0
+                feature_scores[feat] = feature_scores.get(feat, 0.0) + max(val, 0.0)
+
+    ranked = [k for k, _ in sorted(feature_scores.items(), key=lambda kv: kv[1], reverse=True)]
+
+    top_feats: List[str] = []
+    for f in ranked:
+        if f in X_eval.columns:
+            s = pd.to_numeric(X_eval[f], errors="coerce")
+            if s.notna().sum() >= 10:
+                top_feats.append(f)
+        if len(top_feats) >= 5:
+            break
+
+    if len(top_feats) < 5:
+        numeric_cols = X_eval.select_dtypes(include=[np.number]).columns.tolist()
+        for c in numeric_cols:
+            if c not in top_feats:
+                top_feats.append(c)
+            if len(top_feats) >= 5:
+                break
+
+    hist_items: List[Dict[str, Any]] = []
+    for feat in top_feats[:5]:
+        s = pd.to_numeric(X_eval[feat], errors="coerce")
+        pass_vals = s[pass_mask].dropna()
+        fail_vals = s[~pass_mask].dropna()
+
+        # cap payload size
+        if len(pass_vals) > 2000:
+            pass_vals = pass_vals.sample(2000, random_state=67)
+        if len(fail_vals) > 2000:
+            fail_vals = fail_vals.sample(2000, random_state=67)
+
+        hist_items.append(
+            {
+                "feature": str(feat),
+                "pass_values": pass_vals.astype(float).tolist(),
+                "fail_values": fail_vals.astype(float).tolist(),
+            }
+        )
+
+    # Probability boxplot records by top class groups and PASS/FAIL
+    prob_records: List[Dict[str, Any]] = []
+    if y_prob is not None:
+        y_prob = np.asarray(y_prob)
+        if y_prob.ndim == 2 and len(y_prob) == len(y_series):
+            labels = [str(c) for c in class_names]
+            class_to_idx = {c: i for i, c in enumerate(labels)}
+            y_upper = y_series.astype(str).str.upper().str.strip()
+            group_candidates = _select_distribution_groups(y_upper, max_groups=2)
+
+            pass_idx = None
+            for i, cls in enumerate(labels):
+                cu = cls.upper().strip()
+                if cu == "PASS" or "PASS" in cu:
+                    pass_idx = i
+                    break
+
+            pf_labels = np.where(pass_mask, "PASS", "FAIL")
+
+            if pass_idx is not None and pass_idx < y_prob.shape[1]:
+                p_pass = y_prob[:, pass_idx]
+                p_used = np.where(pass_mask, p_pass, 1.0 - p_pass)
+            else:
+                idx_arr = y_series.map(lambda x: class_to_idx.get(str(x), -1)).to_numpy()
+                p_used = np.array(
+                    [
+                        y_prob[i, j] if 0 <= j < y_prob.shape[1] else np.nan
+                        for i, j in enumerate(idx_arr)
+                    ],
+                    dtype=float,
+                )
+
+            for i in range(len(y_series)):
+                grp = y_upper.iat[i]
+                pv = p_used[i]
+                if grp not in group_candidates or not np.isfinite(pv):
+                    continue
+                prob_records.append(
+                    {
+                        "group": grp,
+                        "pass_fail": str(pf_labels[i]),
+                        "probability": float(np.clip(pv, 0.0, 1.0)),
+                    }
+                )
+
+    return {
+        "top_shap_hist": hist_items,
+        "probability_box": prob_records,
+    }
+
+
 # -----------------------------
 # Train: XGBoost
 # -----------------------------
@@ -417,6 +579,13 @@ def _train_xgboost(X: pd.DataFrame, y: pd.Series, cfg: dict) -> dict:
         contrib,
         class_names=class_names,
     )
+    visual_plots = _build_visual_plot_payload(
+        X_test.reset_index(drop=True),
+        pd.Series(y_test_labels).reset_index(drop=True),
+        y_prob,
+        class_names,
+        shap_importance,
+    )
 
     wavg = report_dict.get("weighted avg", {}) or {}
     return {
@@ -437,6 +606,7 @@ def _train_xgboost(X: pd.DataFrame, y: pd.Series, cfg: dict) -> dict:
         "roc": roc_list,
         "bins": bins_df,
         "shap_importance": shap_importance,
+        "visual_plots": visual_plots,
     }
 
 
@@ -542,6 +712,15 @@ def _train_catboost(X: pd.DataFrame, y: pd.Series, cfg: dict) -> dict:
         )
     except Exception:
         shap_importance = {}
+    visual_plots = _build_visual_plot_payload(
+        X_test.reset_index(drop=True)
+        if isinstance(X_test, pd.DataFrame)
+        else pd.DataFrame(X_test),
+        pd.Series(y_test.astype(str)).reset_index(drop=True),
+        y_prob,
+        class_names,
+        shap_importance,
+    )
 
     wavg = report_dict.get("weighted avg", {}) or {}
     return {
@@ -561,6 +740,7 @@ def _train_catboost(X: pd.DataFrame, y: pd.Series, cfg: dict) -> dict:
         "roc": roc_list,
         "bins": bins_df,
         "shap_importance": shap_importance,
+        "visual_plots": visual_plots,
     }
 
 
@@ -766,6 +946,13 @@ def run_analysis_with_artifact(
             contrib,
             class_names=label_classes,
         )
+        visual_plots = _build_visual_plot_payload(
+            X_num.reset_index(drop=True),
+            pd.Series(y_true).reset_index(drop=True),
+            y_prob,
+            label_classes,
+            shap_importance,
+        )
 
         wavg = report_dict.get("weighted avg", {}) or {}
         return {
@@ -782,6 +969,7 @@ def run_analysis_with_artifact(
             "roc": roc_list,
             "bins": bins_df,
             "shap_importance": shap_importance,
+            "visual_plots": visual_plots,
             "class_names": label_classes,
             "dataframe": df_filtered.copy(),
             "meta": {
@@ -856,6 +1044,13 @@ def run_analysis_with_artifact(
             )
         except Exception:
             shap_importance = {}
+        visual_plots = _build_visual_plot_payload(
+            X_cb.reset_index(drop=True),
+            pd.Series(y_true).reset_index(drop=True),
+            y_prob,
+            class_names,
+            shap_importance,
+        )
 
         wavg = report_dict.get("weighted avg", {}) or {}
         return {
@@ -872,6 +1067,7 @@ def run_analysis_with_artifact(
             "roc": roc_list,
             "bins": bins_df,
             "shap_importance": shap_importance,
+            "visual_plots": visual_plots,
             "class_names": class_names,
             "dataframe": df_filtered.copy(),
             "meta": {

@@ -1,6 +1,11 @@
 # main.py
 import sys, os
 import re
+import json
+import html
+import io
+import base64
+from datetime import datetime
 import pandas as pd
 
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -8,6 +13,7 @@ from PySide6.QtCore import Qt, Signal, Slot, QThreadPool, QRunnable, QObject
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
+from matplotlib.patches import Patch
 
 from analysis import run_analysis, run_analysis_with_artifact, save_model_artifact
 from widgets import DropZone, ClickTile
@@ -21,6 +27,80 @@ _ID_NAME_RE = re.compile(
     re.IGNORECASE,
 )
 _DATE_NAME_RE = re.compile(r"(date|time|timestamp|datetime)", re.IGNORECASE)
+
+
+def _safe_filename(s: str) -> str:
+    s = (s or "").strip()
+    s = re.sub(r"[^A-Za-z0-9._-]+", "_", s)
+    s = s.strip("._-")
+    return s or "run"
+
+
+def _df_to_records(df: pd.DataFrame, max_rows: int | None = None) -> list[dict]:
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return []
+    use = df if max_rows is None else df.head(max_rows)
+    out = use.where(pd.notna(use), None).to_dict(orient="records")
+    return out
+
+
+def _results_to_saved_payload(results: dict) -> dict:
+    bins_df = results.get("bins", pd.DataFrame())
+    shap_imp = results.get("shap_importance", {}) or {}
+    shap_json = {}
+    if isinstance(shap_imp, dict):
+        for k, v in shap_imp.items():
+            if isinstance(v, pd.DataFrame):
+                shap_json[str(k)] = _df_to_records(v, max_rows=500)
+
+    roc_json = []
+    for r in results.get("roc", []) or []:
+        roc_json.append(
+            {
+                "class": str(r.get("class", "")),
+                "fpr": [float(x) for x in list(r.get("fpr", []))],
+                "tpr": [float(x) for x in list(r.get("tpr", []))],
+                "auc": float(r.get("auc", 0.0)),
+            }
+        )
+
+    metrics = {
+        str(k): float(v) if isinstance(v, (int, float)) else v
+        for k, v in (results.get("metrics", {}) or {}).items()
+    }
+
+    return {
+        "model_name": str(results.get("model_name", "")),
+        "metrics": metrics,
+        "classification_report": results.get("classification_report", {}) or {},
+        "classification_report_text": results.get("classification_report_text", ""),
+        "meta": results.get("meta", {}) or {},
+        "bins": _df_to_records(bins_df, max_rows=None),
+        "roc": roc_json,
+        "shap_importance": shap_json,
+        "visual_plots": results.get("visual_plots", {}) or {},
+        # Dashboard table displays up to 1000 rows anyway.
+        "dataframe": _df_to_records(results.get("dataframe", pd.DataFrame()), max_rows=1000),
+    }
+
+
+def _saved_payload_to_results(payload: dict) -> dict:
+    shap_out = {}
+    for k, rows in (payload.get("shap_importance", {}) or {}).items():
+        shap_out[str(k)] = pd.DataFrame(rows or [])
+
+    return {
+        "model_name": payload.get("model_name", "Saved Run"),
+        "metrics": payload.get("metrics", {}) or {},
+        "classification_report": payload.get("classification_report", {}) or {},
+        "classification_report_text": payload.get("classification_report_text", ""),
+        "meta": payload.get("meta", {}) or {},
+        "bins": pd.DataFrame(payload.get("bins", []) or []),
+        "roc": payload.get("roc", []) or [],
+        "shap_importance": shap_out,
+        "visual_plots": payload.get("visual_plots", {}) or {},
+        "dataframe": pd.DataFrame(payload.get("dataframe", []) or []),
+    }
 
 
 def suggest_drop_columns_weak(df: pd.DataFrame) -> list[str]:
@@ -207,6 +287,8 @@ class AnalyzeWorker(QRunnable):
 class SplashPage(QtWidgets.QWidget):
     requestTrain = Signal(str, dict)
     requestLoadTrained = Signal(str)
+    requestViewSavedRuns = Signal()
+    requestExportSavedRun = Signal()
 
     def __init__(self):
         super().__init__()
@@ -250,11 +332,11 @@ class SplashPage(QtWidgets.QWidget):
 
         self.selectedLabel = QtWidgets.QLabel("")
         self.selectedLabel.setWordWrap(True)
-        self.selectedLabel.setStyleSheet("color:#666;")
+        self.selectedLabel.setProperty("muted", True)
 
         self.dropSummary = QtWidgets.QLabel("Drop columns: —")
         self.dropSummary.setWordWrap(True)
-        self.dropSummary.setStyleSheet("color:#666;")
+        self.dropSummary.setProperty("muted", True)
 
         self.reviewDropsBtn = QtWidgets.QPushButton("Review Drops…")
         self.reviewDropsBtn.setMinimumHeight(36)
@@ -262,7 +344,7 @@ class SplashPage(QtWidgets.QWidget):
 
         orLbl = QtWidgets.QLabel("— or —")
         orLbl.setAlignment(Qt.AlignCenter)
-        orLbl.setStyleSheet("color:#888;")
+        orLbl.setProperty("muted", True)
 
         left.layout().addWidget(self.drop)
         left.layout().addWidget(orLbl)
@@ -298,7 +380,7 @@ class SplashPage(QtWidgets.QWidget):
             "Upload a dataset to see recommended target columns."
         )
         self.targetHint.setWordWrap(True)
-        self.targetHint.setStyleSheet("color:#666;")
+        self.targetHint.setProperty("muted", True)
 
         tv.addWidget(self.targetCombo)
         tv.addWidget(self.targetHint)
@@ -320,18 +402,24 @@ class SplashPage(QtWidgets.QWidget):
         right = make_column("Already Trained?")
         hint = QtWidgets.QLabel("(insert file)")
         hint.setAlignment(Qt.AlignCenter)
-        hint.setStyleSheet("color:#777;")
+        hint.setProperty("muted", True)
 
         self.loadTileBtn = QtWidgets.QPushButton("Browse Trained Artifact…")
         self.loadTileBtn.setMinimumHeight(40)
+        self.viewSavedRunsBtn = QtWidgets.QPushButton("View Saved Runs…")
+        self.viewSavedRunsBtn.setMinimumHeight(36)
+        self.exportSavedRunBtn = QtWidgets.QPushButton("Export Saved Run…")
+        self.exportSavedRunBtn.setMinimumHeight(36)
 
         self.modelLabel = QtWidgets.QLabel("")
         self.modelLabel.setWordWrap(True)
-        self.modelLabel.setStyleSheet("color:#666;")
+        self.modelLabel.setProperty("muted", True)
 
         right.layout().addWidget(hint)
         right.layout().addSpacing(8)
         right.layout().addWidget(self.loadTileBtn)
+        right.layout().addWidget(self.viewSavedRunsBtn)
+        right.layout().addWidget(self.exportSavedRunBtn)
         right.layout().addWidget(self.modelLabel)
         right.layout().addStretch(1)
         columns.addWidget(right, 1)
@@ -357,6 +445,10 @@ class SplashPage(QtWidgets.QWidget):
         self.trainBtn.clicked.connect(self._on_train_click)
 
         self.loadTileBtn.clicked.connect(self._on_load_trained_clicked)
+        self.viewSavedRunsBtn.clicked.connect(lambda: self.requestViewSavedRuns.emit())
+        self.exportSavedRunBtn.clicked.connect(
+            lambda: self.requestExportSavedRun.emit()
+        )
 
         self._update_train_enabled()
 
@@ -666,19 +758,49 @@ class DashboardTabs(QtWidgets.QTabWidget):
         kpi_wrap.setMaximumHeight(140)
         d.addWidget(kpi_wrap)
 
-        self.ovBar = ChartCard("Class Distribution (Test)", height=380)
-        self.ovRoc = ChartCard("ROC Curves (Preview)", height=380)
+        self.ovBar = ChartCard("Class Distribution (Test)", height=250)
+        self.ovRoc = ChartCard("ROC Curves (Preview)", height=250)
+        self.ovTopHist = ChartCard(
+            "Top Feature Histograms (PASS vs FAIL, Top 5 SHAP)", height=250
+        )
+        self.ovProbBox = ChartCard(
+            "Model Probability by Group (PASS/FAIL)", height=250
+        )
 
-        charts_row = QtWidgets.QHBoxLayout()
-        charts_row.setSpacing(16)
-        charts_row.addWidget(self.ovBar, 1)
-        charts_row.addWidget(self.ovRoc, 1)
+        charts_grid = QtWidgets.QGridLayout()
+        charts_grid.setHorizontalSpacing(16)
+        charts_grid.setVerticalSpacing(16)
+        charts_grid.addWidget(self.ovBar, 0, 0)
+        charts_grid.addWidget(self.ovRoc, 0, 1)
+        charts_grid.addWidget(self.ovTopHist, 1, 0)
+        charts_grid.addWidget(self.ovProbBox, 1, 1)
+        charts_grid.setColumnStretch(0, 1)
+        charts_grid.setColumnStretch(1, 1)
 
         charts_wrap = QtWidgets.QWidget()
-        charts_wrap.setLayout(charts_row)
-        charts_wrap.setMinimumHeight(380)
-        charts_wrap.setMaximumHeight(380)
+        charts_wrap.setLayout(charts_grid)
+        charts_wrap.setMinimumHeight(530)
+        charts_wrap.setMaximumHeight(530)
         d.addWidget(charts_wrap)
+
+        self.perClassCard = QtWidgets.QGroupBox("Per-Class Metrics")
+        self.perClassCard.setMinimumHeight(220)
+        self.perClassCard.setMaximumHeight(240)
+        per_v = QtWidgets.QVBoxLayout(self.perClassCard)
+        self.perClassTable = QtWidgets.QTableWidget()
+        self.perClassTable.setColumnCount(5)
+        self.perClassTable.setHorizontalHeaderLabels(
+            ["Class", "Precision", "Recall", "F1", "Support"]
+        )
+        self.perClassTable.verticalHeader().setVisible(False)
+        self.perClassTable.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.perClassTable.setSelectionMode(QtWidgets.QAbstractItemView.NoSelection)
+        self.perClassTable.setAlternatingRowColors(True)
+        self.perClassTable.horizontalHeader().setSectionResizeMode(
+            QtWidgets.QHeaderView.Stretch
+        )
+        per_v.addWidget(self.perClassTable)
+        d.addWidget(self.perClassCard)
 
         d.addStretch(1)
 
@@ -740,6 +862,8 @@ class DashboardTabs(QtWidgets.QTabWidget):
         metrics = results.get("metrics", {}) or {}
         bins = results.get("bins", pd.DataFrame())
         roc_list = results.get("roc", [])
+        visual_plots = results.get("visual_plots", {}) or {}
+        class_report = results.get("classification_report", {}) or {}
 
         # KPIs
         self.kpiAccuracy.value.setText(
@@ -793,12 +917,188 @@ class DashboardTabs(QtWidgets.QTabWidget):
         self.ovRoc.canvas.figure.tight_layout()
         self.ovRoc.canvas.draw()
 
+        # Top SHAP feature histograms: PASS vs FAIL
+        fig_hist = self.ovTopHist.canvas.figure
+        fig_hist.clear()
+        hist_items = visual_plots.get("top_shap_hist", []) or []
+        if not hist_items:
+            axh = fig_hist.add_subplot(111)
+            axh.text(
+                0.5,
+                0.5,
+                "No top-feature histogram data available.",
+                ha="center",
+                va="center",
+                transform=axh.transAxes,
+            )
+            axh.set_axis_off()
+        else:
+            n = min(5, len(hist_items))
+            cols = 3 if n > 3 else n
+            rows = 2 if n > 3 else 1
+            for i, item in enumerate(hist_items[:5]):
+                axh = fig_hist.add_subplot(rows, cols, i + 1)
+                pass_vals = item.get("pass_values", []) or []
+                fail_vals = item.get("fail_values", []) or []
+
+                if pass_vals:
+                    axh.hist(
+                        pass_vals,
+                        bins=24,
+                        alpha=0.55,
+                        density=True,
+                        color="#2fc1ff",
+                        label="PASS",
+                    )
+                if fail_vals:
+                    axh.hist(
+                        fail_vals,
+                        bins=24,
+                        alpha=0.55,
+                        density=True,
+                        color="#ff7b72",
+                        label="FAIL",
+                    )
+
+                title = str(item.get("feature", "feature"))
+                if len(title) > 26:
+                    title = title[:23] + "..."
+                axh.set_title(title, fontsize=9)
+                if i == 0:
+                    axh.legend(fontsize=8)
+        fig_hist.tight_layout()
+        self.ovTopHist.canvas.draw()
+
+        # Probability boxplot by dataset groups with PASS/FAIL grouping
+        fig_box = self.ovProbBox.canvas.figure
+        fig_box.clear()
+        axb = fig_box.add_subplot(111)
+        box_records = visual_plots.get("probability_box", []) or []
+        if not box_records:
+            axb.text(
+                0.5,
+                0.5,
+                "No probability group data available.",
+                ha="center",
+                va="center",
+                transform=axb.transAxes,
+            )
+            axb.set_axis_off()
+        else:
+            bdf = pd.DataFrame(box_records)
+            if "group" not in bdf.columns and "cal_group" in bdf.columns:
+                bdf["group"] = bdf["cal_group"]
+            group_order = bdf["group"].dropna().astype(str).drop_duplicates().tolist()
+            if not group_order:
+                group_order = sorted(bdf["group"].dropna().astype(str).unique().tolist())
+
+            pos = []
+            vals = []
+            colors = []
+            labels = []
+            offset = {"PASS": -0.16, "FAIL": 0.16}
+            color_map = {"PASS": "#2fc1ff", "FAIL": "#ff7b72"}
+
+            for i, grp in enumerate(group_order):
+                base = i + 1
+                for pf in ["PASS", "FAIL"]:
+                    arr = (
+                        bdf[
+                            (bdf["group"] == grp) & (bdf["pass_fail"] == pf)
+                        ]["probability"]
+                        .dropna()
+                        .to_numpy()
+                    )
+                    if len(arr) == 0:
+                        continue
+                    vals.append(arr)
+                    pos.append(base + offset[pf])
+                    colors.append(color_map[pf])
+                    labels.append(pf)
+
+            if vals:
+                bp = axb.boxplot(
+                    vals,
+                    positions=pos,
+                    widths=0.28,
+                    patch_artist=True,
+                    showfliers=False,
+                )
+                for patch, c in zip(bp["boxes"], colors):
+                    patch.set_facecolor(c)
+                    patch.set_alpha(0.6)
+                for median in bp["medians"]:
+                    median.set_linewidth(1.5)
+
+                axb.set_xticks([i + 1 for i in range(len(group_order))])
+                axb.set_xticklabels(group_order)
+                axb.set_ylim(0.0, 1.0)
+                axb.set_xlabel("Distribution Group")
+                axb.set_ylabel("Probability")
+                legend_items = [
+                    Patch(facecolor="#2fc1ff", alpha=0.6, label="PASS"),
+                    Patch(facecolor="#ff7b72", alpha=0.6, label="FAIL"),
+                ]
+                axb.legend(handles=legend_items, fontsize=8)
+            else:
+                axb.text(
+                    0.5,
+                    0.5,
+                    "No probability values available for boxplot.",
+                    ha="center",
+                    va="center",
+                    transform=axb.transAxes,
+                )
+                axb.set_axis_off()
+        fig_box.tight_layout()
+        self.ovProbBox.canvas.draw()
+
+        # Per-class precision / recall / f1
+        class_order = []
+        if (
+            isinstance(bins, pd.DataFrame)
+            and not bins.empty
+            and "bin_name" in bins.columns
+        ):
+            class_order = [str(x) for x in bins["bin_name"].tolist()]
+        if not class_order and isinstance(class_report, dict):
+            for k, v in class_report.items():
+                if isinstance(v, dict) and {"precision", "recall", "f1-score"}.issubset(
+                    set(v.keys())
+                ):
+                    class_order.append(str(k))
+
+        rows = []
+        for cls in class_order:
+            row = class_report.get(cls, {})
+            if not isinstance(row, dict):
+                continue
+            if not {"precision", "recall", "f1-score"}.issubset(set(row.keys())):
+                continue
+            rows.append(
+                (
+                    cls,
+                    float(row.get("precision", 0.0)),
+                    float(row.get("recall", 0.0)),
+                    float(row.get("f1-score", 0.0)),
+                    int(row.get("support", 0)),
+                )
+            )
+
+        self.perClassTable.setRowCount(len(rows))
+        for i, (cls, p, r, f1, sup) in enumerate(rows):
+            self.perClassTable.setItem(i, 0, QtWidgets.QTableWidgetItem(str(cls)))
+            self.perClassTable.setItem(i, 1, QtWidgets.QTableWidgetItem(f"{p:.4f}"))
+            self.perClassTable.setItem(i, 2, QtWidgets.QTableWidgetItem(f"{r:.4f}"))
+            self.perClassTable.setItem(i, 3, QtWidgets.QTableWidgetItem(f"{f1:.4f}"))
+            self.perClassTable.setItem(i, 4, QtWidgets.QTableWidgetItem(str(int(sup))))
+
         # Feature importance tables
         self._clear_layout(self.fiTablesLayout)
         shap_importance = results.get("shap_importance", {}) or {}
         if not isinstance(shap_importance, dict) or not shap_importance:
             msg = QtWidgets.QLabel("No per-class feature importance available.")
-            msg.setStyleSheet("color:#666;")
+            msg.setProperty("muted", True)
             self.fiTablesLayout.addWidget(msg, 0, 0)
             return
 
@@ -918,7 +1218,7 @@ class DashboardTabs(QtWidgets.QTabWidget):
             msg = QtWidgets.QLabel(
                 "No per-class feature importance tables were generated."
             )
-            msg.setStyleSheet("color:#666;")
+            msg.setProperty("muted", True)
             self.fiTablesLayout.addWidget(msg, 0, 0)
 
 
@@ -928,6 +1228,7 @@ class DashboardTabs(QtWidgets.QTabWidget):
 class DashboardPage(QtWidgets.QWidget):
     requestModify = Signal()
     requestSave = Signal()
+    requestSaveRun = Signal()
 
     def __init__(self):
         super().__init__()
@@ -947,13 +1248,32 @@ class DashboardPage(QtWidgets.QWidget):
         self.modifyBtn.clicked.connect(lambda: self.requestModify.emit())
         self.saveBtn = QtWidgets.QPushButton("save model")
         self.saveBtn.clicked.connect(lambda: self.requestSave.emit())
+        self.saveRunBtn = QtWidgets.QPushButton("save run")
+        self.saveRunBtn.clicked.connect(lambda: self.requestSaveRun.emit())
+        self.readOnlyLabel = QtWidgets.QLabel("Viewing saved run (read-only)")
+        self.readOnlyLabel.setProperty("muted", True)
+        self.readOnlyLabel.hide()
+        actions.addStretch()
+        actions.addWidget(self.readOnlyLabel)
         actions.addStretch()
         actions.addWidget(self.modifyBtn)
+        actions.addWidget(self.saveRunBtn)
         actions.addWidget(self.saveBtn)
         root.addLayout(actions)
 
     def populate(self, results: dict):
         self.tabs.populate(results)
+
+    def set_mode(
+        self,
+        *,
+        read_only: bool,
+        can_save_model: bool,
+        can_save_run: bool,
+    ):
+        self.readOnlyLabel.setVisible(read_only)
+        self.saveBtn.setEnabled(can_save_model and not read_only)
+        self.saveRunBtn.setEnabled(can_save_run and not read_only)
 
 
 # -----------------------------
@@ -965,10 +1285,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.setWindowTitle("Cisco Silicon Failure Characterization")
         self.resize(1100, 720)
 
-        style = os.path.join(os.path.dirname(__file__), "styles.qss")
-        if os.path.exists(style):
-            with open(style, "r", encoding="utf-8") as f:
-                self.setStyleSheet(f.read())
+        base_dir = os.path.dirname(__file__)
+        self.theme_files = {
+            "dark": os.path.join(base_dir, "styles.qss"),
+            "light": os.path.join(base_dir, "styles_light.qss"),
+        }
+        self.current_theme = "dark"
+        self._apply_theme(self.current_theme)
 
         self.stack = QtWidgets.QStackedWidget()
         self.setCentralWidget(self.stack)
@@ -983,19 +1306,62 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.threadpool = QThreadPool()
         self.last_results = None
+        self.viewing_saved_run = False
+        self.saved_runs_dir = os.path.join(base_dir, "saved_runs")
+        os.makedirs(self.saved_runs_dir, exist_ok=True)
 
         self.splash.requestTrain.connect(self.start_training)
         self.splash.requestLoadTrained.connect(self.load_trained)
+        self.splash.requestViewSavedRuns.connect(self.open_saved_run)
+        self.splash.requestExportSavedRun.connect(self.export_saved_run_html)
 
         self.training.cancelRequested.connect(self.to_splash)
         self.dashboard.requestModify.connect(self.to_splash)
         self.dashboard.requestSave.connect(self.save_current_model)
+        self.dashboard.requestSaveRun.connect(self.save_current_run_snapshot)
+        self.dashboard.set_mode(read_only=False, can_save_model=False, can_save_run=False)
+
+        self.themeToggle = QtWidgets.QPushButton()
+        self.themeToggle.clicked.connect(self._toggle_theme)
+        self.themeToggle.setToolTip("Switch between dark and light mode.")
+        self.themeToggle.setFixedWidth(42)
+        self.statusBar().addPermanentWidget(self.themeToggle)
+        self._refresh_theme_toggle_label()
+
+    def _read_stylesheet(self, path: str) -> str:
+        if not os.path.exists(path):
+            return ""
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+
+    def _apply_theme(self, theme: str):
+        theme = theme if theme in self.theme_files else "dark"
+        qss = self._read_stylesheet(self.theme_files[theme])
+        if qss:
+            self.setStyleSheet(qss)
+            self.current_theme = theme
+        self._refresh_theme_toggle_label()
+
+    def _toggle_theme(self):
+        next_theme = "light" if self.current_theme == "dark" else "dark"
+        self._apply_theme(next_theme)
+
+    def _refresh_theme_toggle_label(self):
+        if hasattr(self, "themeToggle"):
+            if self.current_theme == "dark":
+                self.themeToggle.setText("☀")
+                self.themeToggle.setToolTip("Switch to light mode")
+            else:
+                self.themeToggle.setText("☾")
+                self.themeToggle.setToolTip("Switch to dark mode")
 
     @Slot()
     def to_splash(self):
+        self.viewing_saved_run = False
         self.stack.setCurrentIndex(0)
 
     def start_training(self, data_path: str, config: dict):
+        self.viewing_saved_run = False
         self.stack.setCurrentIndex(1)
         worker = TrainWorker(data_path, config)
         worker.signals.finished.connect(self._on_result_ready)
@@ -1010,6 +1376,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
         self.last_results = payload
         self.dashboard.populate(payload)
+        self.dashboard.set_mode(
+            read_only=self.viewing_saved_run,
+            can_save_model=bool(payload.get("artifact")),
+            can_save_run=True,
+        )
         self.stack.setCurrentIndex(2)
 
     def save_current_model(self):
@@ -1047,11 +1418,465 @@ class MainWindow(QtWidgets.QMainWindow):
         if not data_path:
             return
 
+        self.viewing_saved_run = False
         self.stack.setCurrentIndex(1)
         worker = AnalyzeWorker(data_path, artifact_path)
         worker.signals.finished.connect(self._on_result_ready)
         worker.signals.status.connect(lambda s: self.statusBar().showMessage(s, 3000))
         self.threadpool.start(worker)
+
+    def save_current_run_snapshot(self):
+        if not self.last_results:
+            QtWidgets.QMessageBox.information(self, "No run", "Train a model first.")
+            return
+        if self.viewing_saved_run:
+            QtWidgets.QMessageBox.information(
+                self, "Read-only", "Saved runs are read-only and cannot be re-saved."
+            )
+            return
+
+        default_name = datetime.now().strftime("run_%Y-%m-%d_%H-%M-%S")
+        run_name, ok = QtWidgets.QInputDialog.getText(
+            self, "Save Run", "Enter a name for this training run:", text=default_name
+        )
+        if not ok:
+            return
+        run_name = (run_name or "").strip()
+        if not run_name:
+            QtWidgets.QMessageBox.information(self, "Name required", "Run name is required.")
+            return
+
+        payload = _results_to_saved_payload(self.last_results)
+        snapshot = {
+            "schema_version": 1,
+            "run_name": run_name,
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "payload": payload,
+        }
+
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        base = f"{ts}_{_safe_filename(run_name)}"
+        out_path = os.path.join(self.saved_runs_dir, f"{base}.json")
+        n = 1
+        while os.path.exists(out_path):
+            out_path = os.path.join(self.saved_runs_dir, f"{base}_{n}.json")
+            n += 1
+
+        try:
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(snapshot, f, indent=2)
+            QtWidgets.QMessageBox.information(
+                self, "Run saved", f"Saved run snapshot:\n{os.path.basename(out_path)}"
+            )
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Save failed", str(e))
+
+    def _list_saved_run_files(self) -> list[str]:
+        files = []
+        try:
+            for name in os.listdir(self.saved_runs_dir):
+                if name.lower().endswith(".json"):
+                    files.append(os.path.join(self.saved_runs_dir, name))
+        except Exception:
+            return []
+        files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        return files
+
+    def _read_saved_run_snapshot(self, path: str) -> dict:
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+
+    def _choose_saved_run_file(self, title: str, prompt: str) -> tuple[str | None, dict | None]:
+        files = self._list_saved_run_files()
+        if not files:
+            QtWidgets.QMessageBox.information(
+                self, "No saved runs", "No saved run snapshots found yet."
+            )
+            return None, None
+
+        labels = []
+        label_to_file: dict[str, str] = {}
+        for p in files:
+            label = os.path.basename(p)
+            try:
+                data = self._read_saved_run_snapshot(p)
+                run_name = str(data.get("run_name", "")).strip()
+                saved_at = str(data.get("saved_at", "")).strip()
+                model = str(((data.get("payload") or {}).get("model_name", ""))).strip()
+                label = f"{run_name or os.path.basename(p)} | {saved_at} | {model or 'run'}"
+            except Exception:
+                label = os.path.basename(p)
+            labels.append(label)
+            label_to_file[label] = p
+
+        chosen, ok = QtWidgets.QInputDialog.getItem(
+            self, title, prompt, labels, 0, False
+        )
+        if not ok or not chosen:
+            return None, None
+
+        path = label_to_file.get(chosen)
+        if not path:
+            return None, None
+
+        try:
+            snapshot = self._read_saved_run_snapshot(path)
+            return path, snapshot
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Open failed", str(e))
+            return None, None
+
+    def _fig_to_base64_png(self, fig: Figure) -> str:
+        buf = io.BytesIO()
+        fig.savefig(buf, format="png", dpi=130, bbox_inches="tight")
+        buf.seek(0)
+        return base64.b64encode(buf.read()).decode("ascii")
+
+    def _build_saved_run_charts(self, results: dict) -> dict[str, str]:
+        charts: dict[str, str] = {}
+
+        # Class distribution
+        bins = results.get("bins", pd.DataFrame())
+        if isinstance(bins, pd.DataFrame) and not bins.empty and {"bin_name", "count"}.issubset(bins.columns):
+            fig = Figure(figsize=(7.2, 3.4), dpi=110)
+            ax = fig.add_subplot(111)
+            ax.bar(bins["bin_name"].astype(str), bins["count"].astype(float), color="#13a8f1")
+            ax.set_xlabel("Class")
+            ax.set_ylabel("Count")
+            fig.tight_layout()
+            charts["distribution"] = self._fig_to_base64_png(fig)
+
+        # ROC
+        roc_list = results.get("roc", []) or []
+        if roc_list:
+            fig = Figure(figsize=(7.2, 3.4), dpi=110)
+            ax = fig.add_subplot(111)
+            for r in roc_list[:6]:
+                try:
+                    ax.plot(r.get("fpr", []), r.get("tpr", []), label=f"{r.get('class', '')} (AUC={float(r.get('auc', 0.0)):.3f})")
+                except Exception:
+                    continue
+            ax.plot([0, 1], [0, 1], "--", linewidth=1, color="#777")
+            ax.set_xlabel("FPR")
+            ax.set_ylabel("TPR")
+            if ax.lines:
+                ax.legend(fontsize=8)
+            fig.tight_layout()
+            charts["roc"] = self._fig_to_base64_png(fig)
+
+        visual = results.get("visual_plots", {}) or {}
+
+        # Top SHAP histograms
+        hist_items = visual.get("top_shap_hist", []) or []
+        if hist_items:
+            n = min(5, len(hist_items))
+            cols = 3 if n > 3 else n
+            rows = 2 if n > 3 else 1
+            fig = Figure(figsize=(8.6, 4.6), dpi=110)
+            for i, item in enumerate(hist_items[:5]):
+                ax = fig.add_subplot(rows, cols, i + 1)
+                pass_vals = item.get("pass_values", []) or []
+                fail_vals = item.get("fail_values", []) or []
+                if pass_vals:
+                    ax.hist(pass_vals, bins=24, density=True, alpha=0.55, color="#26bdfd", label="PASS")
+                if fail_vals:
+                    ax.hist(fail_vals, bins=24, density=True, alpha=0.55, color="#ff7d75", label="FAIL")
+                title = str(item.get("feature", "feature"))
+                if len(title) > 28:
+                    title = title[:25] + "..."
+                ax.set_title(title, fontsize=9)
+                if i == 0:
+                    ax.legend(fontsize=7)
+            fig.tight_layout()
+            charts["top_hist"] = self._fig_to_base64_png(fig)
+
+        # Probability box by group
+        records = visual.get("probability_box", []) or []
+        if records:
+            bdf = pd.DataFrame(records)
+            if "group" not in bdf.columns and "cal_group" in bdf.columns:
+                bdf["group"] = bdf["cal_group"]
+            if {"group", "pass_fail", "probability"}.issubset(bdf.columns):
+                fig = Figure(figsize=(7.2, 3.4), dpi=110)
+                ax = fig.add_subplot(111)
+                group_order = bdf["group"].dropna().astype(str).drop_duplicates().tolist()
+                pos, vals, colors = [], [], []
+                offset = {"PASS": -0.16, "FAIL": 0.16}
+                color_map = {"PASS": "#2fc1ff", "FAIL": "#ff7b72"}
+                for i, grp in enumerate(group_order):
+                    base = i + 1
+                    for pf in ["PASS", "FAIL"]:
+                        arr = (
+                            bdf[(bdf["group"].astype(str) == grp) & (bdf["pass_fail"].astype(str) == pf)]["probability"]
+                            .dropna()
+                            .to_numpy()
+                        )
+                        if len(arr) == 0:
+                            continue
+                        vals.append(arr)
+                        pos.append(base + offset[pf])
+                        colors.append(color_map[pf])
+                if vals:
+                    bp = ax.boxplot(vals, positions=pos, widths=0.28, patch_artist=True, showfliers=False)
+                    for patch, c in zip(bp["boxes"], colors):
+                        patch.set_facecolor(c)
+                        patch.set_alpha(0.6)
+                    ax.set_xticks([i + 1 for i in range(len(group_order))])
+                    ax.set_xticklabels(group_order)
+                    ax.set_ylim(0.0, 1.0)
+                    ax.set_xlabel("Distribution Group")
+                    ax.set_ylabel("Probability")
+                    ax.legend(
+                        handles=[
+                            Patch(facecolor="#2fc1ff", alpha=0.6, label="PASS"),
+                            Patch(facecolor="#ff7b72", alpha=0.6, label="FAIL"),
+                        ],
+                        fontsize=8,
+                    )
+                    fig.tight_layout()
+                    charts["prob_box"] = self._fig_to_base64_png(fig)
+
+        return charts
+
+    def _build_saved_run_html(self, snapshot: dict, results: dict) -> str:
+        run_name = str(snapshot.get("run_name", "Saved Run"))
+        saved_at = str(snapshot.get("saved_at", ""))
+        meta = results.get("meta", {}) or {}
+        metrics = results.get("metrics", {}) or {}
+        charts = self._build_saved_run_charts(results)
+        class_report = results.get("classification_report", {}) or {}
+        df_preview = results.get("dataframe", pd.DataFrame())
+        if not isinstance(df_preview, pd.DataFrame):
+            df_preview = pd.DataFrame()
+        df_preview = df_preview.head(80)
+        preview_html = (
+            df_preview.to_html(index=False, border=0, classes="data-table")
+            if not df_preview.empty
+            else "<p>No table preview available.</p>"
+        )
+
+        metric_cards = []
+        metric_keys = [
+            ("Accuracy", "Accuracy"),
+            ("Precision_weighted", "Precision (w)"),
+            ("Recall_weighted", "Recall (w)"),
+            ("F1_weighted", "F1 (w)"),
+        ]
+        for k, label in metric_keys:
+            v = metrics.get(k, None)
+            text = f"{float(v):.4f}" if isinstance(v, (int, float)) else "—"
+            metric_cards.append(
+                f"<div class='card metric'><div class='label'>{html.escape(label)}</div><div class='value'>{html.escape(text)}</div></div>"
+            )
+        metric_cards.append(
+            f"<div class='card metric'><div class='label'>Model</div><div class='value compact'>{html.escape(str(results.get('model_name', '—')))}</div></div>"
+        )
+        metric_cards.append(
+            f"<div class='card metric'><div class='label'>Target</div><div class='value compact'>{html.escape(str(meta.get('target_column', '—')))}</div></div>"
+        )
+        metric_cards.append(
+            f"<div class='card metric'><div class='label'>Classes</div><div class='value compact'>{html.escape(str(meta.get('num_classes', '—')))}</div></div>"
+        )
+
+        chart_blocks = []
+        chart_labels = [
+            ("distribution", "Class Distribution"),
+            ("roc", "ROC Curves"),
+            ("top_hist", "Top SHAP Histograms (PASS/FAIL)"),
+            ("prob_box", "Probability by Group (PASS/FAIL)"),
+        ]
+        for key, label in chart_labels:
+            if key in charts:
+                chart_blocks.append(
+                    f"<div class='card chart'><h3>{html.escape(label)}</h3><img src='data:image/png;base64,{charts[key]}' alt='{html.escape(label)}' /></div>"
+                )
+
+        fi_sections = []
+        shap_imp = results.get("shap_importance", {}) or {}
+        if isinstance(shap_imp, dict):
+            for cls_name, df_cls in shap_imp.items():
+                if not isinstance(df_cls, pd.DataFrame) or df_cls.empty:
+                    continue
+                fi_sections.append(
+                    f"<details class='card fi'><summary>{html.escape(str(cls_name))} - Top Features</summary><div class='table-wrap'>{df_cls.head(20).to_html(index=False, border=0, classes='data-table')}</div></details>"
+                )
+
+        per_class_rows = []
+        class_order = []
+        bins = results.get("bins", pd.DataFrame())
+        if isinstance(bins, pd.DataFrame) and not bins.empty and "bin_name" in bins.columns:
+            class_order = [str(x) for x in bins["bin_name"].tolist()]
+        if not class_order and isinstance(class_report, dict):
+            for k, v in class_report.items():
+                if isinstance(v, dict) and {"precision", "recall", "f1-score"}.issubset(set(v.keys())):
+                    class_order.append(str(k))
+        for cls in class_order:
+            row = class_report.get(cls, {})
+            if not isinstance(row, dict):
+                continue
+            if not {"precision", "recall", "f1-score"}.issubset(set(row.keys())):
+                continue
+            per_class_rows.append(
+                {
+                    "Class": cls,
+                    "Precision": f"{float(row.get('precision', 0.0)):.4f}",
+                    "Recall": f"{float(row.get('recall', 0.0)):.4f}",
+                    "F1": f"{float(row.get('f1-score', 0.0)):.4f}",
+                    "Support": int(row.get("support", 0)),
+                }
+            )
+        per_class_html = (
+            pd.DataFrame(per_class_rows).to_html(index=False, border=0, classes="data-table")
+            if per_class_rows
+            else "<p>No per-class metrics available.</p>"
+        )
+
+        meta_items = [
+            ("Saved At", saved_at),
+            ("Run Name", run_name),
+            ("Mode", meta.get("mode", "")),
+            ("Model Type", meta.get("model_type", "")),
+            ("Data Path", meta.get("data_path", "")),
+            ("Rows", meta.get("n_rows", "")),
+            ("Columns (Original)", meta.get("n_cols_original", "")),
+            ("Columns (After Filter)", meta.get("n_cols_after_filter", "")),
+        ]
+        meta_html = "".join(
+            f"<div><span>{html.escape(str(k))}</span><strong>{html.escape(str(v))}</strong></div>"
+            for k, v in meta_items if str(v).strip() != ""
+        )
+
+        return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{html.escape(run_name)} - Cisco Silicon Failure Characterization</title>
+  <style>
+    :root {{ --bg:#0f141c; --panel:#171f2b; --ink:#e7edf8; --muted:#9fb0c5; --cyan:#27bcff; --line:#2f3a4d; }}
+    body {{ margin:0; font-family:"Avenir Next","Segoe UI",Arial,sans-serif; color:var(--ink); background:radial-gradient(circle at top right,#1d2f46,#0f141c 55%); }}
+    .wrap {{ max-width:1320px; margin:28px auto; padding:0 18px 28px; }}
+    h1 {{ font-size:30px; margin:6px 0 4px; }}
+    .sub {{ color:var(--muted); margin-bottom:14px; }}
+    .grid {{ display:grid; gap:14px; }}
+    .metrics {{ grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); }}
+    .meta {{ grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); }}
+    .charts {{ grid-template-columns:repeat(auto-fit,minmax(420px,1fr)); }}
+    .card {{ background:linear-gradient(180deg,#1b2432,#151d2a); border:1px solid var(--line); border-radius:14px; padding:12px 14px; box-shadow:0 10px 30px rgba(0,0,0,.25); }}
+    .metric .label {{ color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.04em; }}
+    .metric .value {{ font-size:26px; font-weight:700; margin-top:6px; color:#edf5ff; line-height:1.15; overflow-wrap:anywhere; word-break:break-word; white-space:normal; }}
+    .metric .value.compact {{ font-size:18px; line-height:1.25; }}
+    .meta div {{ display:flex; justify-content:space-between; gap:10px; padding:6px 0; border-bottom:1px solid #253143; align-items:flex-start; }}
+    .meta div:last-child {{ border-bottom:none; }}
+    .meta span {{ color:var(--muted); }}
+    .meta strong {{ max-width:70%; text-align:right; overflow-wrap:anywhere; word-break:break-word; }}
+    .chart h3 {{ margin:2px 0 8px; color:#dce7f8; font-size:16px; }}
+    .chart img {{ width:100%; border-radius:10px; background:#fff; }}
+    .section {{ margin-top:14px; }}
+    .table-wrap {{ width:100%; overflow-x:auto; overflow-y:hidden; border-radius:10px; border:1px solid #273549; }}
+    .data-table {{ width:max-content; min-width:100%; border-collapse:collapse; font-size:12px; white-space:nowrap; }}
+    .data-table th,.data-table td {{ border:1px solid #304058; padding:6px 8px; text-align:left; }}
+    .data-table th {{ background:#1f2b3c; position:sticky; top:0; }}
+    details.fi summary {{ cursor:pointer; font-weight:600; color:#dbe8ff; }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>{html.escape(run_name)}</h1>
+    <div class="sub">Saved run report · {html.escape(saved_at)}</div>
+
+    <section class="grid metrics">
+      {''.join(metric_cards)}
+    </section>
+
+    <section class="grid meta section card">
+      {meta_html}
+    </section>
+
+    <section class="grid charts section">
+      {''.join(chart_blocks) if chart_blocks else "<div class='card'>No chart images available in this snapshot.</div>"}
+    </section>
+
+    <section class="section card">
+      <h3>Per-Class Metrics</h3>
+      <div class="table-wrap">{per_class_html}</div>
+    </section>
+
+    <section class="section card">
+      <h3>Data Preview</h3>
+      <div class="table-wrap">{preview_html}</div>
+    </section>
+
+    <section class="section grid">
+      {''.join(fi_sections) if fi_sections else "<div class='card'>No feature-importance tables available.</div>"}
+    </section>
+  </div>
+</body>
+</html>"""
+
+    def export_saved_run_html(self):
+        path, snapshot = self._choose_saved_run_file(
+            "Export Saved Run", "Select a saved run to export:"
+        )
+        if not path or not snapshot:
+            return
+
+        try:
+            results = _saved_payload_to_results(snapshot.get("payload", {}) or {})
+            report_html = self._build_saved_run_html(snapshot, results)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Export failed", str(e))
+            return
+
+        base_name = _safe_filename(
+            str(snapshot.get("run_name", "")).strip() or os.path.splitext(os.path.basename(path))[0]
+        )
+        out_default = os.path.join(self.saved_runs_dir, f"{base_name}.html")
+        out_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Export Saved Run to HTML",
+            out_default,
+            "HTML (*.html);;All Files (*.*)",
+        )
+        if not out_path:
+            return
+        if not out_path.lower().endswith(".html"):
+            out_path += ".html"
+
+        try:
+            with open(out_path, "w", encoding="utf-8") as f:
+                f.write(report_html)
+            QtWidgets.QMessageBox.information(
+                self, "Exported", f"Saved run exported to:\n{out_path}"
+            )
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Export failed", str(e))
+
+    def open_saved_run(self):
+        path, snapshot = self._choose_saved_run_file(
+            "Open Saved Run", "Select a saved run:"
+        )
+        if not path or not snapshot:
+            return
+
+        try:
+            payload = snapshot.get("payload", {}) or {}
+            results = _saved_payload_to_results(payload)
+            results["meta"] = results.get("meta", {}) or {}
+            results["meta"]["mode"] = "saved-run"
+            results["meta"]["saved_run_name"] = snapshot.get("run_name", "")
+            results["meta"]["saved_run_file"] = os.path.basename(path)
+            self.viewing_saved_run = True
+            self.last_results = results
+            self.dashboard.populate(results)
+            self.dashboard.set_mode(
+                read_only=True,
+                can_save_model=False,
+                can_save_run=False,
+            )
+            self.stack.setCurrentIndex(2)
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Open failed", str(e))
 
 
 def main():
