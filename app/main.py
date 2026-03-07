@@ -359,7 +359,16 @@ class SplashPage(QtWidgets.QWidget):
         middle = make_column("Training")
 
         self.combo = QtWidgets.QComboBox()
-        self.combo.addItems(["-- select --", "CatBoost", "XGBoost"])
+        self.combo.addItems(
+            [
+                "-- select --",
+                "CatBoost",
+                "XGBoost",
+                "Mega Multiclass XGBoost",
+                "Mega OVR XGBoost",
+                "Mega Hierarchical XGBoost",
+            ]
+        )
         self.combo.setMinimumHeight(36)
 
         self.gpuCheck = QtWidgets.QCheckBox("Use GPU (if available)")
@@ -551,7 +560,13 @@ class SplashPage(QtWidgets.QWidget):
             self._set_data_path(path)
 
     def _update_train_enabled(self):
-        valid_model = self.combo.currentText() in {"CatBoost", "XGBoost"}
+        valid_model = self.combo.currentText() in {
+            "CatBoost",
+            "XGBoost",
+            "Mega Multiclass XGBoost",
+            "Mega OVR XGBoost",
+            "Mega Hierarchical XGBoost",
+        }
         valid_target = bool(self.targetCombo.currentText().strip())
         self.trainBtn.setEnabled(bool(self.data_path) and valid_model and valid_target)
 
@@ -563,9 +578,17 @@ class SplashPage(QtWidgets.QWidget):
             return
 
         model_type = self.combo.currentText()
-        if model_type not in {"CatBoost", "XGBoost"}:
+        if model_type not in {
+            "CatBoost",
+            "XGBoost",
+            "Mega Multiclass XGBoost",
+            "Mega OVR XGBoost",
+            "Mega Hierarchical XGBoost",
+        }:
             QtWidgets.QMessageBox.information(
-                self, "Choose model", "Please select CatBoost or XGBoost."
+                self,
+                "Choose model",
+                "Please select a model option.",
             )
             return
 
