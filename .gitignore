@@ -2,3 +2,7 @@
 XGBoost
 .DS_Store
 app/catboost_info/
+.venv/
+__pycache__/
+*.pyc
+saved_runs/
