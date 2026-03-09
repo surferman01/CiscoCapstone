@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import importlib.util
 import os
+import json
 
 import pandas as pd
 
@@ -10,7 +12,16 @@ from PySide6.QtCore import Qt, Signal
 
 from core.preprocessing import suggest_drop_columns_weak
 from styles import APP_NAME, resolve_logo_path
-from ui.components import ChartCard, ColumnDropDialog, KPIBox, PandasModel
+from ui.components import (
+    ChartCard,
+    ColumnDropDialog,
+    HyperparameterDialog,
+    KPIBox,
+    PandasModel,
+    coerce_hyperparameters,
+    default_hyperparameters,
+    summarize_hyperparameters,
+)
 from widgets import DropZone
 
 
@@ -22,7 +33,16 @@ class SplashPage(QtWidgets.QWidget):
 
     def __init__(self):
         super().__init__()
-        layout = QtWidgets.QVBoxLayout(self)
+        outer = QtWidgets.QVBoxLayout(self)
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QtWidgets.QFrame.NoFrame)
+        outer.addWidget(scroll)
+
+        content = QtWidgets.QWidget()
+        scroll.setWidget(content)
+
+        layout = QtWidgets.QVBoxLayout(content)
 
         title = QtWidgets.QLabel(APP_NAME)
         title.setObjectName("titleBar")
@@ -126,10 +146,25 @@ class SplashPage(QtWidgets.QWidget):
         self.trainBtn.setMinimumHeight(44)
         self.trainBtn.setEnabled(False)
 
+        self.hyperparamSummary = QtWidgets.QLabel("Hyperparameters: Defaults")
+        self.hyperparamSummary.setWordWrap(True)
+        self.hyperparamSummary.setProperty("muted", True)
+
+        self.hyperparamBtn = QtWidgets.QPushButton("Hyperparameters...")
+        self.hyperparamBtn.setMinimumHeight(36)
+        self.loadPresetBtn = QtWidgets.QPushButton("Load Hyperparameters...")
+        self.loadPresetBtn.setMinimumHeight(36)
+        self.savePresetBtn = QtWidgets.QPushButton("Save Current Preset...")
+        self.savePresetBtn.setMinimumHeight(36)
+
         middle.layout().addWidget(QtWidgets.QLabel("Model"))
         middle.layout().addWidget(self.combo)
         middle.layout().addWidget(self.gpuCheck)
         middle.layout().addWidget(self.targetBox)
+        middle.layout().addWidget(self.hyperparamSummary)
+        middle.layout().addWidget(self.hyperparamBtn)
+        middle.layout().addWidget(self.loadPresetBtn)
+        middle.layout().addWidget(self.savePresetBtn)
         middle.layout().addSpacing(8)
         middle.layout().addWidget(self.trainBtn)
         middle.layout().addStretch(1)
@@ -169,19 +204,25 @@ class SplashPage(QtWidgets.QWidget):
         self.all_columns: list[str] = []
         self.suggested_drop_cols: list[str] = []
         self.user_drop_cols: list[str] = []
+        self.hyperparams = default_hyperparameters()
 
         self.drop.fileDropped.connect(self._on_file_dropped)
         self.browseBtn.clicked.connect(self._on_browse_clicked)
         self.reviewDropsBtn.clicked.connect(self._on_review_drops)
         self.combo.currentIndexChanged.connect(self._update_train_enabled)
+        self.combo.currentTextChanged.connect(self._update_hyperparam_summary)
         self.targetCombo.currentTextChanged.connect(self._update_train_enabled)
         self.trainBtn.clicked.connect(self._on_train_click)
+        self.hyperparamBtn.clicked.connect(self._on_edit_hyperparams)
+        self.loadPresetBtn.clicked.connect(self._on_load_preset)
+        self.savePresetBtn.clicked.connect(self._on_save_preset)
         self.loadTileBtn.clicked.connect(self._on_load_trained_clicked)
         self.viewSavedRunsBtn.clicked.connect(lambda: self.requestViewSavedRuns.emit())
         self.exportSavedRunBtn.clicked.connect(
             lambda: self.requestExportSavedRun.emit()
         )
 
+        self._update_hyperparam_summary()
         self._update_train_enabled()
 
     def _recommend_targets(self, df: pd.DataFrame, max_cols: int = 10) -> list[str]:
@@ -291,6 +332,137 @@ class SplashPage(QtWidgets.QWidget):
         valid_target = bool(self.targetCombo.currentText().strip())
         self.trainBtn.setEnabled(bool(self.data_path) and valid_model and valid_target)
 
+    def _current_model_type(self) -> str:
+        return self.combo.currentText().strip()
+
+    def _missing_dependencies_for_training(self, model_type: str) -> list[str]:
+        needed = []
+        if model_type == "CatBoost":
+            needed.append("catboost")
+        elif model_type == "XGBoost":
+            needed.append("xgboost")
+        elif model_type in {
+            "Mega Multiclass XGBoost",
+            "Mega OVR XGBoost",
+            "Mega Hierarchical XGBoost",
+        }:
+            needed.append("xgboost")
+            tuned_keys = {
+                "best_params",
+                "best_stage1_params",
+                "best_stage2_params",
+            }
+            has_tuned_preset = any(
+                key in (self.hyperparams or {}) for key in tuned_keys
+            )
+            if not has_tuned_preset:
+                needed.append("optuna")
+
+        return [
+            module
+            for module in needed
+            if importlib.util.find_spec(module) is None
+        ]
+
+    def _update_hyperparam_summary(self):
+        model_type = self._current_model_type()
+        if model_type.startswith("--"):
+            self.hyperparamSummary.setText("Hyperparameters: Select a model first.")
+            return
+        summary = summarize_hyperparameters(model_type, self.hyperparams)
+        self.hyperparamSummary.setText(f"Hyperparameters: {summary}")
+
+    def _on_edit_hyperparams(self):
+        model_type = self._current_model_type()
+        if model_type.startswith("--"):
+            QtWidgets.QMessageBox.information(
+                self, "Choose model", "Select a model before editing hyperparameters."
+            )
+            return
+
+        dlg = HyperparameterDialog(self, model_type, self.hyperparams)
+        if dlg.exec() == QtWidgets.QDialog.Accepted:
+            self.hyperparams = coerce_hyperparameters(model_type, dlg.values())
+            self._update_hyperparam_summary()
+
+    def _current_preset_payload(self) -> dict:
+        model_type = self._current_model_type()
+        return {
+            "schema_version": 1,
+            "model_type": model_type,
+            "use_gpu": self.gpuCheck.isChecked(),
+            "hyperparameters": coerce_hyperparameters(model_type, self.hyperparams),
+        }
+
+    def _apply_preset_payload(self, payload: dict):
+        model_type = str(payload.get("model_type", "")).strip()
+        if model_type in {
+            "CatBoost",
+            "XGBoost",
+            "Mega Multiclass XGBoost",
+            "Mega OVR XGBoost",
+            "Mega Hierarchical XGBoost",
+        }:
+            idx = self.combo.findText(model_type)
+            if idx >= 0:
+                self.combo.setCurrentIndex(idx)
+        if "use_gpu" in payload:
+            self.gpuCheck.setChecked(bool(payload.get("use_gpu")))
+        self.hyperparams = coerce_hyperparameters(
+            self._current_model_type(), payload.get("hyperparameters", {})
+        )
+        self._update_hyperparam_summary()
+
+    def _on_save_preset(self):
+        model_type = self._current_model_type()
+        if model_type.startswith("--"):
+            QtWidgets.QMessageBox.information(
+                self, "Choose model", "Select a model before saving a preset."
+            )
+            return
+
+        out_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Save Hyperparameter Preset",
+            f"{model_type.lower().replace(' ', '_')}_preset.json",
+            "JSON (*.json);;All Files (*.*)",
+        )
+        if not out_path:
+            return
+        if not out_path.lower().endswith(".json"):
+            out_path += ".json"
+
+        try:
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(self._current_preset_payload(), f, indent=2)
+            QtWidgets.QMessageBox.information(
+                self, "Preset saved", f"Saved hyperparameter preset:\n{out_path}"
+            )
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Save failed", str(e))
+
+    def _on_load_preset(self):
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Load Hyperparameters",
+            "",
+            "JSON (*.json);;All Files (*.*)",
+        )
+        if not path:
+            return
+
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            if not isinstance(payload, dict):
+                raise ValueError("Preset file must contain a JSON object.")
+            self._apply_preset_payload(payload)
+            QtWidgets.QMessageBox.information(
+                self, "Preset loaded", f"Loaded hyperparameter preset:\n{path}"
+            )
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Load failed", str(e))
+
     def _on_train_click(self):
         if not self.data_path:
             QtWidgets.QMessageBox.information(
@@ -310,6 +482,16 @@ class SplashPage(QtWidgets.QWidget):
                 self,
                 "Choose model",
                 "Please select a model option.",
+            )
+            return
+
+        missing_modules = self._missing_dependencies_for_training(model_type)
+        if missing_modules:
+            missing_text = ", ".join(missing_modules)
+            QtWidgets.QMessageBox.critical(
+                self,
+                "Missing dependency",
+                f"The selected training mode requires missing Python module(s): {missing_text}.",
             )
             return
 
@@ -359,6 +541,7 @@ class SplashPage(QtWidgets.QWidget):
             "recommended_targets": recs,
             "exclude_columns": exclude_cols,
         }
+        config.update(coerce_hyperparameters(model_type, self.hyperparams))
 
         self.requestTrain.emit(self.data_path, config)
 
@@ -790,7 +973,7 @@ class DashboardTabs(QtWidgets.QTabWidget):
         else:
             class_list = [str(k) for k in shap_importance.keys()]
 
-        cols_per_row = 3
+        cols_per_row = 1
         added = 0
 
         for idx, cls_name in enumerate(class_list):
@@ -886,10 +1069,10 @@ class DashboardTabs(QtWidgets.QTabWidget):
 
             vbox.addWidget(table)
 
-            row_i = idx // cols_per_row
-            col_i = idx % cols_per_row
+            row_i = added
+            col_i = 0
             self.fiTablesLayout.addWidget(group, row_i, col_i)
-            self.fiTablesLayout.setColumnStretch(col_i, 1)
+            self.fiTablesLayout.setColumnStretch(0, 1)
             added += 1
 
         if added == 0:
@@ -904,6 +1087,7 @@ class DashboardPage(QtWidgets.QWidget):
     requestModify = Signal()
     requestSave = Signal()
     requestSaveRun = Signal()
+    requestSaveHyperparameters = Signal()
 
     def __init__(self):
         super().__init__()
@@ -923,6 +1107,10 @@ class DashboardPage(QtWidgets.QWidget):
         self.saveBtn.clicked.connect(lambda: self.requestSave.emit())
         self.saveRunBtn = QtWidgets.QPushButton("save run")
         self.saveRunBtn.clicked.connect(lambda: self.requestSaveRun.emit())
+        self.saveHyperparamsBtn = QtWidgets.QPushButton("save hyperparameters")
+        self.saveHyperparamsBtn.clicked.connect(
+            lambda: self.requestSaveHyperparameters.emit()
+        )
         self.readOnlyLabel = QtWidgets.QLabel("Viewing saved run (read-only)")
         self.readOnlyLabel.setProperty("muted", True)
         self.readOnlyLabel.hide()
@@ -930,6 +1118,7 @@ class DashboardPage(QtWidgets.QWidget):
         actions.addWidget(self.readOnlyLabel)
         actions.addStretch()
         actions.addWidget(self.modifyBtn)
+        actions.addWidget(self.saveHyperparamsBtn)
         actions.addWidget(self.saveRunBtn)
         actions.addWidget(self.saveBtn)
         root.addLayout(actions)
@@ -943,7 +1132,9 @@ class DashboardPage(QtWidgets.QWidget):
         read_only: bool,
         can_save_model: bool,
         can_save_run: bool,
+        can_save_hyperparameters: bool = True,
     ):
         self.readOnlyLabel.setVisible(read_only)
         self.saveBtn.setEnabled(can_save_model and not read_only)
         self.saveRunBtn.setEnabled(can_save_run and not read_only)
+        self.saveHyperparamsBtn.setEnabled(can_save_hyperparameters and not read_only)

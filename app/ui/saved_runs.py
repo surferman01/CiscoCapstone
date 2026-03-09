@@ -66,6 +66,40 @@ def results_to_saved_payload(results: dict) -> dict:
     }
 
 
+def results_to_hyperparameter_payload(results: dict) -> dict:
+    meta = results.get("meta", {}) or {}
+    training_config = meta.get("training_config", {}) or {}
+    hyperparameters = dict(training_config.get("hyperparameters", {}) or {})
+
+    for key in [
+        "best_sampler",
+        "best_weight_power",
+        "best_params",
+        "best_scale_multiplier",
+        "best_stage1_sampler",
+        "best_stage2_sampler",
+        "best_stage1_weight_power",
+        "best_stage2_weight_power",
+        "best_stage1_scale_multiplier",
+        "best_stage1_params",
+        "best_stage2_params",
+        "best_fail_threshold",
+        "class_thresholds",
+    ]:
+        if key in meta:
+            hyperparameters[key] = meta.get(key)
+
+    return {
+        "schema_version": 1,
+        "source": "training-result",
+        "model_type": training_config.get("model_type", meta.get("model_type", "")),
+        "use_gpu": training_config.get(
+            "use_gpu", meta.get("use_gpu_requested", True)
+        ),
+        "hyperparameters": hyperparameters,
+    }
+
+
 def saved_payload_to_results(payload: dict) -> dict:
     shap_out = {}
     for k, rows in (payload.get("shap_importance", {}) or {}).items():

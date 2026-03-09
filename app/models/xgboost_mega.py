@@ -10,6 +10,7 @@ from sklearn.metrics import f1_score
 from sklearn.preprocessing import LabelEncoder
 
 from core.evaluation import (
+    _build_xgb_contrib_importance_tables,
     _build_visual_plot_payload,
     _build_xgb_trial_params,
     _class_weight_from_power,
@@ -23,7 +24,6 @@ from core.preprocessing import _prep_for_xgboost
 
 
 def _train_xgboost_mega_multiclass(X: pd.DataFrame, y: pd.Series, cfg: dict) -> dict:
-    import optuna
     from xgboost import XGBClassifier
 
     y_series = pd.Series(y).astype(str)
@@ -50,49 +50,64 @@ def _train_xgboost_mega_multiclass(X: pd.DataFrame, y: pd.Series, cfg: dict) -> 
 
     tree_method = "hist"
 
-    def objective(trial) -> float:
-        sampler = trial.suggest_categorical(
-            "sampler",
-            ["none", "random_over", "smote", "borderline_smote", "adasyn", "smoteenn"],
-        )
-        weight_power = trial.suggest_float("class_weight_power", 0.5, 2.0)
-        params = _build_xgb_trial_params(trial)
-        X_res, y_res = _safe_sample_data(sampler, X_train, y_train, seed=42)
-        sample_weight, _ = _class_weight_from_power(y_res, power=weight_power)
+    best_sampler = None
+    best_weight_power = None
+    best_params = None
+    used_preset = False
+    study_trials = 0
 
-        model = XGBClassifier(
-            objective="multi:softprob",
-            eval_metric="mlogloss",
-            random_state=42,
-            tree_method=tree_method,
-            n_jobs=8,
-            **params,
-        )
-        model.fit(
-            X_res,
-            y_res,
-            eval_set=[(X_val, y_val)],
-            sample_weight=sample_weight,
-            verbose=False,
-        )
-        val_pred = model.predict(X_val)
-        return float(f1_score(y_val, val_pred, average="macro"))
+    if isinstance(cfg.get("best_params"), dict) and cfg.get("best_sampler") is not None:
+        best_sampler = str(cfg.get("best_sampler"))
+        best_weight_power = float(cfg.get("best_weight_power", 1.0))
+        best_params = dict(cfg.get("best_params") or {})
+        used_preset = True
+    else:
+        import optuna
 
-    study = optuna.create_study(
-        direction="maximize",
-        sampler=optuna.samplers.TPESampler(seed=42),
-        pruner=optuna.pruners.MedianPruner(n_warmup_steps=8),
-    )
-    study.optimize(
-        objective, n_trials=int(cfg.get("mega_n_trials", 45)), show_progress_bar=False
-    )
-    best = study.best_trial
+        def objective(trial) -> float:
+            sampler = trial.suggest_categorical(
+                "sampler",
+                ["none", "random_over", "smote", "borderline_smote", "adasyn", "smoteenn"],
+            )
+            weight_power = trial.suggest_float("class_weight_power", 0.5, 2.0)
+            params = _build_xgb_trial_params(trial)
+            X_res, y_res = _safe_sample_data(sampler, X_train, y_train, seed=42)
+            sample_weight, _ = _class_weight_from_power(y_res, power=weight_power)
 
-    best_sampler = str(best.params["sampler"])
-    best_weight_power = float(best.params["class_weight_power"])
-    best_params = {
-        k: v for k, v in best.params.items() if k not in {"sampler", "class_weight_power"}
-    }
+            model = XGBClassifier(
+                objective="multi:softprob",
+                eval_metric="mlogloss",
+                random_state=42,
+                tree_method=tree_method,
+                n_jobs=8,
+                **params,
+            )
+            model.fit(
+                X_res,
+                y_res,
+                eval_set=[(X_val, y_val)],
+                sample_weight=sample_weight,
+                verbose=False,
+            )
+            val_pred = model.predict(X_val)
+            return float(f1_score(y_val, val_pred, average="macro"))
+
+        study = optuna.create_study(
+            direction="maximize",
+            sampler=optuna.samplers.TPESampler(seed=42),
+            pruner=optuna.pruners.MedianPruner(n_warmup_steps=8),
+        )
+        study.optimize(
+            objective, n_trials=int(cfg.get("mega_n_trials", 45)), show_progress_bar=False
+        )
+        best = study.best_trial
+        best_sampler = str(best.params["sampler"])
+        best_weight_power = float(best.params["class_weight_power"])
+        best_params = {
+            k: v for k, v in best.params.items() if k not in {"sampler", "class_weight_power"}
+        }
+        study_trials = int(len(study.trials))
+
     X_res, y_res = _safe_sample_data(best_sampler, X_train, y_train, seed=42)
     sample_weight, _ = _class_weight_from_power(y_res, power=best_weight_power)
 
@@ -120,12 +135,18 @@ def _train_xgboost_mega_multiclass(X: pd.DataFrame, y: pd.Series, cfg: dict) -> 
     test_eval = _evaluate_encoded(y_test, y_test_pred, y_test_prob, class_names)
 
     X_test_df = pd.DataFrame(X_test, columns=training_features)
+    shap_importance = _build_xgb_contrib_importance_tables(
+        model,
+        X_test_df,
+        pd.Series(test_eval["y_true_labels"]),
+        class_names,
+    )
     visual_plots = _build_visual_plot_payload(
         X_test_df.reset_index(drop=True),
         pd.Series(test_eval["y_true_labels"]).reset_index(drop=True),
         y_test_prob,
         class_names,
-        {},
+        shap_importance,
     )
     return {
         "model_name": "Mega Multiclass XGBoost",
@@ -145,21 +166,24 @@ def _train_xgboost_mega_multiclass(X: pd.DataFrame, y: pd.Series, cfg: dict) -> 
         "classification_report_text": test_eval["classification_report_text"],
         "roc": test_eval["roc"],
         "bins": test_eval["bins"],
-        "shap_importance": {},
+        "shap_importance": shap_importance,
         "visual_plots": visual_plots,
         "meta": {
             "mega_pipeline": "multiclass",
-            "n_trials": int(len(study.trials)),
+            "n_trials": int(study_trials),
+            "tuning_source": "preset" if used_preset else "optuna",
             "best_sampler": best_sampler,
             "best_weight_power": best_weight_power,
             "best_params": best_params,
             "val_f1_macro": float(val_eval["metrics"]["F1_macro"]),
+            "feature_importance_source": (
+                "xgboost_pred_contribs" if shap_importance else "unavailable"
+            ),
         },
     }
 
 
 def _train_xgboost_mega_ovr(X: pd.DataFrame, y: pd.Series, cfg: dict) -> dict:
-    import optuna
     from xgboost import XGBClassifier
 
     y_series = pd.Series(y).astype(str)
@@ -282,37 +306,58 @@ def _train_xgboost_mega_ovr(X: pd.DataFrame, y: pd.Series, cfg: dict) -> dict:
             test_probs[:, cls_idx] = model.predict_proba(X_test)[:, 1]
         return val_probs, test_probs, thresholds, best_iterations, models
 
-    def objective(trial) -> float:
-        sampler = trial.suggest_categorical(
-            "sampler",
-            ["none", "random_over", "smote", "borderline_smote", "adasyn", "smoteenn"],
-        )
-        weight_power = trial.suggest_float("class_weight_power", 0.5, 2.0)
-        scale_multiplier = trial.suggest_float("scale_pos_weight_multiplier", 0.5, 3.0)
-        params = _build_xgb_trial_params(trial)
-        val_probs, thresholds, _ = train_ovr(
-            X_train, y_train, X_val, y_val, params, sampler, weight_power, scale_multiplier
-        )
-        val_pred = _predict_with_thresholds(val_probs, thresholds)
-        return float(f1_score(y_val, val_pred, average="macro"))
+    best_sampler = None
+    best_weight_power = None
+    best_scale_multiplier = None
+    best_params = None
+    used_preset = False
+    study_trials = 0
 
-    study = optuna.create_study(
-        direction="maximize",
-        sampler=optuna.samplers.TPESampler(seed=42),
-        pruner=optuna.pruners.MedianPruner(n_warmup_steps=6),
-    )
-    study.optimize(
-        objective, n_trials=int(cfg.get("mega_n_trials", 30)), show_progress_bar=False
-    )
-    best = study.best_trial
-    best_sampler = str(best.params["sampler"])
-    best_weight_power = float(best.params["class_weight_power"])
-    best_scale_multiplier = float(best.params["scale_pos_weight_multiplier"])
-    best_params = {
-        k: v
-        for k, v in best.params.items()
-        if k not in {"sampler", "class_weight_power", "scale_pos_weight_multiplier"}
-    }
+    if (
+        isinstance(cfg.get("best_params"), dict)
+        and cfg.get("best_sampler") is not None
+        and cfg.get("best_scale_multiplier") is not None
+    ):
+        best_sampler = str(cfg.get("best_sampler"))
+        best_weight_power = float(cfg.get("best_weight_power", 1.0))
+        best_scale_multiplier = float(cfg.get("best_scale_multiplier"))
+        best_params = dict(cfg.get("best_params") or {})
+        used_preset = True
+    else:
+        import optuna
+
+        def objective(trial) -> float:
+            sampler = trial.suggest_categorical(
+                "sampler",
+                ["none", "random_over", "smote", "borderline_smote", "adasyn", "smoteenn"],
+            )
+            weight_power = trial.suggest_float("class_weight_power", 0.5, 2.0)
+            scale_multiplier = trial.suggest_float("scale_pos_weight_multiplier", 0.5, 3.0)
+            params = _build_xgb_trial_params(trial)
+            val_probs, thresholds, _ = train_ovr(
+                X_train, y_train, X_val, y_val, params, sampler, weight_power, scale_multiplier
+            )
+            val_pred = _predict_with_thresholds(val_probs, thresholds)
+            return float(f1_score(y_val, val_pred, average="macro"))
+
+        study = optuna.create_study(
+            direction="maximize",
+            sampler=optuna.samplers.TPESampler(seed=42),
+            pruner=optuna.pruners.MedianPruner(n_warmup_steps=6),
+        )
+        study.optimize(
+            objective, n_trials=int(cfg.get("mega_n_trials", 30)), show_progress_bar=False
+        )
+        best = study.best_trial
+        best_sampler = str(best.params["sampler"])
+        best_weight_power = float(best.params["class_weight_power"])
+        best_scale_multiplier = float(best.params["scale_pos_weight_multiplier"])
+        best_params = {
+            k: v
+            for k, v in best.params.items()
+            if k not in {"sampler", "class_weight_power", "scale_pos_weight_multiplier"}
+        }
+        study_trials = int(len(study.trials))
 
     val_probs, test_probs, thresholds, best_iterations, models = train_ovr_and_predict_test(
         best_params, best_sampler, best_weight_power, best_scale_multiplier
@@ -353,7 +398,8 @@ def _train_xgboost_mega_ovr(X: pd.DataFrame, y: pd.Series, cfg: dict) -> dict:
         "visual_plots": visual_plots,
         "meta": {
             "mega_pipeline": "ovr",
-            "n_trials": int(len(study.trials)),
+            "n_trials": int(study_trials),
+            "tuning_source": "preset" if used_preset else "optuna",
             "best_sampler": best_sampler,
             "best_weight_power": best_weight_power,
             "best_scale_multiplier": best_scale_multiplier,
@@ -366,7 +412,6 @@ def _train_xgboost_mega_ovr(X: pd.DataFrame, y: pd.Series, cfg: dict) -> dict:
 
 
 def _train_xgboost_mega_hierarchical(X: pd.DataFrame, y: pd.Series, cfg: dict) -> dict:
-    import optuna
     from xgboost import XGBClassifier
 
     y_series = pd.Series(y).astype(str)
@@ -438,89 +483,112 @@ def _train_xgboost_mega_hierarchical(X: pd.DataFrame, y: pd.Series, cfg: dict) -
                 best_t = float(t)
         return best_t
 
-    def objective(trial) -> float:
-        s1_sampler = trial.suggest_categorical(
-            "stage1_sampler",
-            ["none", "random_over", "smote", "borderline_smote", "adasyn", "smoteenn"],
-        )
-        s2_sampler = trial.suggest_categorical(
-            "stage2_sampler",
-            ["none", "random_over", "smote", "borderline_smote", "adasyn", "smoteenn"],
-        )
-        s1_weight_power = trial.suggest_float("stage1_weight_power", 0.5, 2.0)
-        s2_weight_power = trial.suggest_float("stage2_weight_power", 0.5, 2.0)
-        s1_scale_mult = trial.suggest_float("stage1_scale_multiplier", 0.5, 3.0)
-        s1_params = _build_xgb_trial_params(trial, prefix="s1")
-        s2_params = _build_xgb_trial_params(trial, prefix="s2")
+    used_preset = False
+    study_trials = 0
 
-        X_s1, y_s1 = _safe_sample_data(s1_sampler, X_train, y_train_s1, seed=42)
-        s1_weight, _ = _class_weight_from_power(y_s1, power=s1_weight_power)
-        pos = int(np.sum(y_s1 == 1))
-        neg = int(np.sum(y_s1 == 0))
-        s1_model = XGBClassifier(
-            objective="binary:logistic",
-            eval_metric="logloss",
-            random_state=42,
-            tree_method=tree_method,
-            n_jobs=8,
-            scale_pos_weight=float((neg / max(pos, 1)) * s1_scale_mult),
-            **s1_params,
-        )
-        s1_model.fit(
-            X_s1,
-            y_s1,
-            eval_set=[(X_val, y_val_s1)],
-            sample_weight=s1_weight,
-            verbose=False,
-        )
-        prob_fail_val = s1_model.predict_proba(X_val)[:, 1]
+    if (
+        isinstance(cfg.get("best_stage1_params"), dict)
+        and isinstance(cfg.get("best_stage2_params"), dict)
+        and cfg.get("best_stage1_sampler") is not None
+        and cfg.get("best_stage2_sampler") is not None
+    ):
+        s1_sampler = str(cfg.get("best_stage1_sampler"))
+        s2_sampler = str(cfg.get("best_stage2_sampler"))
+        s1_weight_power = float(cfg.get("best_stage1_weight_power", 1.0))
+        s2_weight_power = float(cfg.get("best_stage2_weight_power", 1.0))
+        s1_scale_mult = float(cfg.get("best_stage1_scale_multiplier", 1.0))
+        s1_params = dict(cfg.get("best_stage1_params") or {})
+        s2_params = dict(cfg.get("best_stage2_params") or {})
+        used_preset = True
+    else:
+        import optuna
 
-        if len(fail_class_indices) <= 1 or len(y_train_s2) == 0:
-            fail_probs_val = np.ones((len(X_val), max(len(fail_class_indices), 1)), dtype=float)
-        else:
-            X_s2, y_s2 = _safe_sample_data(s2_sampler, X_train_s2_base, y_train_s2, seed=42)
-            s2_weight, _ = _class_weight_from_power(y_s2, power=s2_weight_power)
-            s2_model = XGBClassifier(
-                objective="multi:softprob",
-                eval_metric="mlogloss",
+        def objective(trial) -> float:
+            s1_sampler = trial.suggest_categorical(
+                "stage1_sampler",
+                ["none", "random_over", "smote", "borderline_smote", "adasyn", "smoteenn"],
+            )
+            s2_sampler = trial.suggest_categorical(
+                "stage2_sampler",
+                ["none", "random_over", "smote", "borderline_smote", "adasyn", "smoteenn"],
+            )
+            s1_weight_power = trial.suggest_float("stage1_weight_power", 0.5, 2.0)
+            s2_weight_power = trial.suggest_float("stage2_weight_power", 0.5, 2.0)
+            s1_scale_mult = trial.suggest_float("stage1_scale_multiplier", 0.5, 3.0)
+            s1_params = _build_xgb_trial_params(trial, prefix="s1")
+            s2_params = _build_xgb_trial_params(trial, prefix="s2")
+
+            X_s1, y_s1 = _safe_sample_data(s1_sampler, X_train, y_train_s1, seed=42)
+            s1_weight, _ = _class_weight_from_power(y_s1, power=s1_weight_power)
+            pos = int(np.sum(y_s1 == 1))
+            neg = int(np.sum(y_s1 == 0))
+            s1_model = XGBClassifier(
+                objective="binary:logistic",
+                eval_metric="logloss",
                 random_state=42,
                 tree_method=tree_method,
                 n_jobs=8,
-                num_class=len(fail_class_indices),
-                **s2_params,
+                scale_pos_weight=float((neg / max(pos, 1)) * s1_scale_mult),
+                **s1_params,
             )
-            eval_set = [(X_val_s2, y_val_s2)] if len(y_val_s2) > 0 else None
-            fit_kwargs = {"sample_weight": s2_weight, "verbose": False}
-            if eval_set is not None:
-                fit_kwargs["eval_set"] = eval_set
-            s2_model.fit(X_s2, y_s2, **fit_kwargs)
-            fail_probs_val = s2_model.predict_proba(X_val)
+            s1_model.fit(
+                X_s1,
+                y_s1,
+                eval_set=[(X_val, y_val_s1)],
+                sample_weight=s1_weight,
+                verbose=False,
+            )
+            prob_fail_val = s1_model.predict_proba(X_val)[:, 1]
 
-        t = best_threshold(y_val, prob_fail_val, fail_probs_val)
-        pred = predict_hier(prob_fail_val, fail_probs_val, t)
-        return float(f1_score(y_val, pred, average="macro"))
+            if len(fail_class_indices) <= 1 or len(y_train_s2) == 0:
+                fail_probs_val = np.ones((len(X_val), max(len(fail_class_indices), 1)), dtype=float)
+            else:
+                X_s2, y_s2 = _safe_sample_data(
+                    s2_sampler, X_train_s2_base, y_train_s2, seed=42
+                )
+                s2_weight, _ = _class_weight_from_power(y_s2, power=s2_weight_power)
+                s2_model = XGBClassifier(
+                    objective="multi:softprob",
+                    eval_metric="mlogloss",
+                    random_state=42,
+                    tree_method=tree_method,
+                    n_jobs=8,
+                    num_class=len(fail_class_indices),
+                    **s2_params,
+                )
+                eval_set = [(X_val_s2, y_val_s2)] if len(y_val_s2) > 0 else None
+                fit_kwargs = {"sample_weight": s2_weight, "verbose": False}
+                if eval_set is not None:
+                    fit_kwargs["eval_set"] = eval_set
+                s2_model.fit(X_s2, y_s2, **fit_kwargs)
+                fail_probs_val = s2_model.predict_proba(X_val)
 
-    study = optuna.create_study(
-        direction="maximize",
-        sampler=optuna.samplers.TPESampler(seed=42),
-        pruner=optuna.pruners.MedianPruner(n_warmup_steps=6),
-    )
-    study.optimize(
-        objective, n_trials=int(cfg.get("mega_n_trials", 35)), show_progress_bar=False
-    )
-    best = study.best_trial
+            t = best_threshold(y_val, prob_fail_val, fail_probs_val)
+            pred = predict_hier(prob_fail_val, fail_probs_val, t)
+            return float(f1_score(y_val, pred, average="macro"))
 
-    s1_sampler = str(best.params["stage1_sampler"])
-    s2_sampler = str(best.params["stage2_sampler"])
-    s1_weight_power = float(best.params["stage1_weight_power"])
-    s2_weight_power = float(best.params["stage2_weight_power"])
-    s1_scale_mult = float(best.params["stage1_scale_multiplier"])
-    s1_params = {
-        k.replace("s1_", ""): v for k, v in best.params.items() if k.startswith("s1_")
-    }
-    s2_params = {
-        k.replace("s2_", ""): v for k, v in best.params.items() if k.startswith("s2_")
-    }
+        study = optuna.create_study(
+            direction="maximize",
+            sampler=optuna.samplers.TPESampler(seed=42),
+            pruner=optuna.pruners.MedianPruner(n_warmup_steps=6),
+        )
+        study.optimize(
+            objective, n_trials=int(cfg.get("mega_n_trials", 35)), show_progress_bar=False
+        )
+        best = study.best_trial
+
+        s1_sampler = str(best.params["stage1_sampler"])
+        s2_sampler = str(best.params["stage2_sampler"])
+        s1_weight_power = float(best.params["stage1_weight_power"])
+        s2_weight_power = float(best.params["stage2_weight_power"])
+        s1_scale_mult = float(best.params["stage1_scale_multiplier"])
+        s1_params = {
+            k.replace("s1_", ""): v for k, v in best.params.items() if k.startswith("s1_")
+        }
+        s2_params = {
+            k.replace("s2_", ""): v for k, v in best.params.items() if k.startswith("s2_")
+        }
+        study_trials = int(len(study.trials))
 
     X_s1, y_s1 = _safe_sample_data(s1_sampler, X_train, y_train_s1, seed=42)
     s1_weight, _ = _class_weight_from_power(y_s1, power=s1_weight_power)
@@ -615,7 +683,8 @@ def _train_xgboost_mega_hierarchical(X: pd.DataFrame, y: pd.Series, cfg: dict) -
         "visual_plots": visual_plots,
         "meta": {
             "mega_pipeline": "hierarchical",
-            "n_trials": int(len(study.trials)),
+            "n_trials": int(study_trials),
+            "tuning_source": "preset" if used_preset else "optuna",
             "best_stage1_sampler": s1_sampler,
             "best_stage2_sampler": s2_sampler,
             "best_stage1_weight_power": s1_weight_power,

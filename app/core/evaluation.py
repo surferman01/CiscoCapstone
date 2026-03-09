@@ -258,6 +258,45 @@ def _build_per_class_importance_tables(
     return out
 
 
+def _build_xgb_contrib_importance_tables(
+    model: Any,
+    X_num: pd.DataFrame,
+    y_true_labels: pd.Series,
+    class_names: List[str],
+) -> Dict[str, pd.DataFrame]:
+    if not isinstance(X_num, pd.DataFrame) or X_num.empty:
+        return {}
+
+    try:
+        import xgboost as xgb
+    except Exception:
+        return {}
+
+    try:
+        dtest = xgb.DMatrix(X_num, feature_names=list(X_num.columns))
+        contrib = model.get_booster().predict(dtest, pred_contribs=True)
+    except Exception:
+        return {}
+
+    contrib = np.asarray(contrib)
+    num_classes = len(class_names)
+    num_features = X_num.shape[1]
+
+    if (
+        contrib.ndim == 2
+        and num_classes > 2
+        and contrib.shape[1] == num_classes * (num_features + 1)
+    ):
+        contrib = contrib.reshape(contrib.shape[0], num_classes, num_features + 1)
+
+    return _build_per_class_importance_tables(
+        X_num.reset_index(drop=True),
+        pd.Series(y_true_labels).reset_index(drop=True),
+        contrib,
+        class_names=class_names,
+    )
+
+
 def _derive_pass_mask(y_labels: pd.Series) -> np.ndarray:
     s = pd.Series(y_labels).astype(str)
     upper = s.str.upper().str.strip()

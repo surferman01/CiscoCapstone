@@ -6,13 +6,14 @@ import sys
 from datetime import datetime
 
 from PySide6 import QtGui, QtWidgets
-from PySide6.QtCore import QThreadPool, Slot
+from PySide6.QtCore import QStandardPaths, QThreadPool, Slot
 
 from analysis import save_model_artifact
-from styles import APP_NAME
+from styles import APP_NAME, resolve_app_root, resolve_light_qss_path, resolve_qss_path
 from ui.pages import DashboardPage, SplashPage, TrainingPage
 from ui.saved_runs import (
     build_saved_run_html,
+    results_to_hyperparameter_payload,
     results_to_saved_payload,
     safe_filename,
     saved_payload_to_results,
@@ -34,10 +35,9 @@ class MainWindow(QtWidgets.QMainWindow):
             self.resize(1000, 680)
         self.setMinimumSize(680, 500)
 
-        base_dir = os.path.dirname(os.path.dirname(__file__))
         self.theme_files = {
-            "dark": os.path.join(base_dir, "styles.qss"),
-            "light": os.path.join(base_dir, "styles_light.qss"),
+            "dark": str(resolve_qss_path()),
+            "light": str(resolve_light_qss_path()),
         }
         self.current_theme = "dark"
         self._apply_theme(self.current_theme)
@@ -56,7 +56,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.threadpool = QThreadPool()
         self.last_results = None
         self.viewing_saved_run = False
-        self.saved_runs_dir = os.path.join(base_dir, "saved_runs")
+        self.saved_runs_dir = self._resolve_saved_runs_dir()
         os.makedirs(self.saved_runs_dir, exist_ok=True)
 
         self.splash.requestTrain.connect(self.start_training)
@@ -68,7 +68,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.dashboard.requestModify.connect(self.to_splash)
         self.dashboard.requestSave.connect(self.save_current_model)
         self.dashboard.requestSaveRun.connect(self.save_current_run_snapshot)
-        self.dashboard.set_mode(read_only=False, can_save_model=False, can_save_run=False)
+        self.dashboard.requestSaveHyperparameters.connect(self.save_current_hyperparameters)
+        self.dashboard.set_mode(
+            read_only=False,
+            can_save_model=False,
+            can_save_run=False,
+            can_save_hyperparameters=False,
+        )
 
         self.themeToggle = QtWidgets.QPushButton()
         self.themeToggle.clicked.connect(self._toggle_theme)
@@ -76,6 +82,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self.themeToggle.setFixedWidth(42)
         self.statusBar().addPermanentWidget(self.themeToggle)
         self._refresh_theme_toggle_label()
+
+    def _resolve_saved_runs_dir(self) -> str:
+        app_data_dir = QStandardPaths.writableLocation(QStandardPaths.AppDataLocation)
+        if app_data_dir:
+            return os.path.join(app_data_dir, "saved_runs")
+        return os.path.join(str(resolve_app_root()), "saved_runs")
 
     def _read_stylesheet(self, path: str) -> str:
         if not os.path.exists(path):
@@ -129,6 +141,7 @@ class MainWindow(QtWidgets.QMainWindow):
             read_only=self.viewing_saved_run,
             can_save_model=bool(payload.get("artifact")),
             can_save_run=True,
+            can_save_hyperparameters=bool((payload.get("meta", {}) or {}).get("training_config")),
         )
         self.stack.setCurrentIndex(2)
 
@@ -215,6 +228,35 @@ class MainWindow(QtWidgets.QMainWindow):
                 json.dump(snapshot, f, indent=2)
             QtWidgets.QMessageBox.information(
                 self, "Run saved", f"Saved run snapshot:\n{os.path.basename(out_path)}"
+            )
+        except Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Save failed", str(e))
+
+    def save_current_hyperparameters(self):
+        if not self.last_results:
+            QtWidgets.QMessageBox.information(
+                self, "No run", "Train a model first."
+            )
+            return
+
+        payload = results_to_hyperparameter_payload(self.last_results)
+        model_type = str(payload.get("model_type", "")).strip() or "model"
+        out_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Save Hyperparameters",
+            f"{safe_filename(model_type)}_hyperparameters.json",
+            "JSON (*.json);;All Files (*.*)",
+        )
+        if not out_path:
+            return
+        if not out_path.lower().endswith(".json"):
+            out_path += ".json"
+
+        try:
+            with open(out_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2)
+            QtWidgets.QMessageBox.information(
+                self, "Saved", f"Saved hyperparameters:\n{out_path}"
             )
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Save failed", str(e))
@@ -336,6 +378,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 read_only=True,
                 can_save_model=False,
                 can_save_run=False,
+                can_save_hyperparameters=bool(
+                    (results.get("meta", {}) or {}).get("training_config")
+                ),
             )
             self.stack.setCurrentIndex(2)
         except Exception as e:
@@ -344,6 +389,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
 def main():
     app = QtWidgets.QApplication(sys.argv)
+    app.setOrganizationName("Cisco")
     app.setApplicationName(APP_NAME)
 
     font = QtGui.QFont("Inter")

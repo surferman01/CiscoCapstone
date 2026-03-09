@@ -15,6 +15,7 @@ from sklearn.metrics import (
 from core.data import _load_data, _split_features, load_model_artifact
 from core.evaluation import (
     _build_per_class_importance_tables,
+    _build_xgb_contrib_importance_tables,
     _build_visual_plot_payload,
     _compute_roc,
     _predict_with_thresholds,
@@ -31,6 +32,25 @@ from models.xgboost_mega import (
     _train_xgboost_mega_multiclass,
     _train_xgboost_mega_ovr,
 )
+
+
+def _extract_training_config(cfg: dict) -> dict:
+    return {
+        "model_type": str(cfg.get("model_type", "")).strip(),
+        "use_gpu": bool(cfg.get("use_gpu", True)),
+        "hyperparameters": {
+            k: v
+            for k, v in cfg.items()
+            if k
+            not in {
+                "model_type",
+                "use_gpu",
+                "target_column",
+                "recommended_targets",
+                "exclude_columns",
+            }
+        },
+    }
 
 
 def run_analysis(data_path: str, cfg: dict) -> dict:
@@ -99,6 +119,7 @@ def run_analysis(data_path: str, cfg: dict) -> dict:
             "n_cols_original": int(df.shape[1]),
             "n_cols_after_filter": int(df_filtered.shape[1]),
             "dropped_columns_info": drop_meta,
+            "training_config": _extract_training_config(cfg),
         }
     )
     results["meta"] = meta
@@ -113,6 +134,7 @@ def run_analysis(data_path: str, cfg: dict) -> dict:
         "training_features": results.get("training_features") or [],
         "recommended_targets": recommended_targets,
         "exclude_columns": explicit_excludes,
+        "training_config": _extract_training_config(cfg),
     }
     results["artifact"] = artifact
 
@@ -236,6 +258,7 @@ def run_analysis_with_artifact(
                 "num_classes": len(label_classes),
                 "classes": label_classes,
                 "dropped_columns_info": drop_meta,
+                "training_config": art.get("training_config", {}),
             },
         }
 
@@ -324,6 +347,7 @@ def run_analysis_with_artifact(
                 "num_classes": len(class_names),
                 "classes": class_names,
                 "dropped_columns_info": drop_meta,
+                "training_config": art.get("training_config", {}),
             },
         }
 
@@ -394,12 +418,22 @@ def run_analysis_with_artifact(
         counts = pd.Series(y_true).value_counts().reindex(label_classes).fillna(0).astype(int)
         bins_df = pd.DataFrame({"bin_name": label_classes, "count": counts.values})
         roc_list = _compute_roc(y_true, y_prob, label_classes)
+        X_eval_df = pd.DataFrame(X_eval, columns=feat_order).reset_index(drop=True)
+        y_true_series = pd.Series(y_true).reset_index(drop=True)
+        shap_importance = {}
+        if pipeline_type == "mega_multiclass_xgb":
+            shap_importance = _build_xgb_contrib_importance_tables(
+                multi_model,
+                X_eval_df,
+                y_true_series,
+                label_classes,
+            )
         visual_plots = _build_visual_plot_payload(
-            pd.DataFrame(X_eval, columns=feat_order).reset_index(drop=True),
-            pd.Series(y_true).reset_index(drop=True),
+            X_eval_df,
+            y_true_series,
             y_prob,
             label_classes,
-            {},
+            shap_importance,
         )
         wavg = report_dict.get("weighted avg", {}) or {}
         return {
@@ -415,7 +449,7 @@ def run_analysis_with_artifact(
             "classification_report_text": report_text,
             "roc": roc_list,
             "bins": bins_df,
-            "shap_importance": {},
+            "shap_importance": shap_importance,
             "visual_plots": visual_plots,
             "class_names": label_classes,
             "dataframe": df_filtered.copy(),
@@ -427,6 +461,10 @@ def run_analysis_with_artifact(
                 "num_classes": len(label_classes),
                 "classes": label_classes,
                 "dropped_columns_info": drop_meta,
+                "training_config": art.get("training_config", {}),
+                "feature_importance_source": (
+                    "xgboost_pred_contribs" if shap_importance else "unavailable"
+                ),
             },
         }
 
