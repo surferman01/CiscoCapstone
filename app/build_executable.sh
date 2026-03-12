@@ -12,7 +12,6 @@ elif [ "$OS_NAME" = "Linux" ]; then
   PYTHON_BIN="python3"
 else
     PYTHON_BIN=".venv/bin/python"
-    exit 1
 fi
 
 echo "Using Python: $PYTHON_BIN"
