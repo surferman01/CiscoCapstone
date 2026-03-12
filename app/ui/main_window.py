@@ -6,10 +6,10 @@ import sys
 from datetime import datetime
 
 from PySide6 import QtGui, QtWidgets
-from PySide6.QtCore import QStandardPaths, QThreadPool, Slot
+from PySide6.QtCore import QThreadPool, Slot
 
 from analysis import save_model_artifact
-from styles import APP_NAME, resolve_app_root, resolve_light_qss_path, resolve_qss_path
+from styles import APP_NAME, resolve_light_qss_path, resolve_qss_path
 from ui.pages import DashboardPage, SplashPage, TrainingPage
 from ui.saved_runs import (
     build_saved_run_html,
@@ -56,8 +56,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.threadpool = QThreadPool()
         self.last_results = None
         self.viewing_saved_run = False
-        self.saved_runs_dir = self._resolve_saved_runs_dir()
-        os.makedirs(self.saved_runs_dir, exist_ok=True)
 
         self.splash.requestTrain.connect(self.start_training)
         self.splash.requestLoadTrained.connect(self.load_trained)
@@ -82,12 +80,6 @@ class MainWindow(QtWidgets.QMainWindow):
         self.themeToggle.setFixedWidth(42)
         self.statusBar().addPermanentWidget(self.themeToggle)
         self._refresh_theme_toggle_label()
-
-    def _resolve_saved_runs_dir(self) -> str:
-        app_data_dir = QStandardPaths.writableLocation(QStandardPaths.AppDataLocation)
-        if app_data_dir:
-            return os.path.join(app_data_dir, "saved_runs")
-        return os.path.join(str(resolve_app_root()), "saved_runs")
 
     def _read_stylesheet(self, path: str) -> str:
         if not os.path.exists(path):
@@ -217,17 +209,22 @@ class MainWindow(QtWidgets.QMainWindow):
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         base = f"{ts}_{safe_filename(run_name)}"
-        out_path = os.path.join(self.saved_runs_dir, f"{base}.json")
-        n = 1
-        while os.path.exists(out_path):
-            out_path = os.path.join(self.saved_runs_dir, f"{base}_{n}.json")
-            n += 1
+        out_path, _ = QtWidgets.QFileDialog.getSaveFileName(
+            self,
+            "Save Run Snapshot",
+            f"{base}.json",
+            "JSON (*.json);;All Files (*.*)",
+        )
+        if not out_path:
+            return
+        if not out_path.lower().endswith(".json"):
+            out_path += ".json"
 
         try:
             with open(out_path, "w", encoding="utf-8") as f:
                 json.dump(snapshot, f, indent=2)
             QtWidgets.QMessageBox.information(
-                self, "Run saved", f"Saved run snapshot:\n{os.path.basename(out_path)}"
+                self, "Run saved", f"Saved run snapshot:\n{out_path}"
             )
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Save failed", str(e))
@@ -261,17 +258,6 @@ class MainWindow(QtWidgets.QMainWindow):
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, "Save failed", str(e))
 
-    def _list_saved_run_files(self) -> list[str]:
-        files = []
-        try:
-            for name in os.listdir(self.saved_runs_dir):
-                if name.lower().endswith(".json"):
-                    files.append(os.path.join(self.saved_runs_dir, name))
-        except Exception:
-            return []
-        files.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-        return files
-
     def _read_saved_run_snapshot(self, path: str) -> dict:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
@@ -279,35 +265,12 @@ class MainWindow(QtWidgets.QMainWindow):
     def _choose_saved_run_file(
         self, title: str, prompt: str
     ) -> tuple[str | None, dict | None]:
-        files = self._list_saved_run_files()
-        if not files:
-            QtWidgets.QMessageBox.information(
-                self, "No saved runs", "No saved run snapshots found yet."
-            )
-            return None, None
-
-        labels = []
-        label_to_file: dict[str, str] = {}
-        for p in files:
-            label = os.path.basename(p)
-            try:
-                data = self._read_saved_run_snapshot(p)
-                run_name = str(data.get("run_name", "")).strip()
-                saved_at = str(data.get("saved_at", "")).strip()
-                model = str(((data.get("payload") or {}).get("model_name", ""))).strip()
-                label = f"{run_name or os.path.basename(p)} | {saved_at} | {model or 'run'}"
-            except Exception:
-                label = os.path.basename(p)
-            labels.append(label)
-            label_to_file[label] = p
-
-        chosen, ok = QtWidgets.QInputDialog.getItem(
-            self, title, prompt, labels, 0, False
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            title,
+            "",
+            "Saved Run JSON (*.json);;All Files (*.*)",
         )
-        if not ok or not chosen:
-            return None, None
-
-        path = label_to_file.get(chosen)
         if not path:
             return None, None
 
@@ -336,7 +299,7 @@ class MainWindow(QtWidgets.QMainWindow):
             str(snapshot.get("run_name", "")).strip()
             or os.path.splitext(os.path.basename(path))[0]
         )
-        out_default = os.path.join(self.saved_runs_dir, f"{base_name}.html")
+        out_default = os.path.join(os.path.dirname(path), f"{base_name}.html")
         out_path, _ = QtWidgets.QFileDialog.getSaveFileName(
             self,
             "Export Saved Run to HTML",

@@ -180,6 +180,29 @@ def _compute_roc(
     return out
 
 
+def _infer_pass_reference_label(class_names: List[str]) -> Optional[str]:
+    labels = [str(c).strip() for c in class_names if str(c).strip()]
+    if not labels:
+        return None
+
+    upper = [label.upper() for label in labels]
+
+    for i, label_u in enumerate(upper):
+        if label_u == "PASS":
+            return labels[i]
+
+    for i, label_u in enumerate(upper):
+        if "PASS" in label_u:
+            return labels[i]
+
+    fail_idxs = [i for i, label_u in enumerate(upper) if "FAIL" in label_u]
+    if len(labels) == 2 and len(fail_idxs) == 1:
+        other_idx = 1 - fail_idxs[0]
+        return labels[other_idx]
+
+    return None
+
+
 def _build_per_class_importance_tables(
     X_num: pd.DataFrame,
     y_true_labels: pd.Series,
@@ -190,7 +213,7 @@ def _build_per_class_importance_tables(
     feats = list(X_num.columns)
     y_series = pd.Series(y_true_labels).astype(str).reset_index(drop=True)
 
-    baseline = "PASS" if "PASS" in [str(c) for c in class_names] else None
+    baseline = _infer_pass_reference_label(class_names)
 
     contrib = np.asarray(contrib)
     if contrib.ndim == 2:
@@ -226,12 +249,20 @@ def _build_per_class_importance_tables(
             if mask_base.sum() > 0:
                 pass_avg = np.nanmean(X_vals[mask_base, :], axis=0)
                 pass_std = np.nanstd(X_vals[mask_base, :], axis=0)
+                reference_label = baseline
             else:
                 pass_avg = np.nanmean(X_vals[~mask_cls, :], axis=0)
                 pass_std = np.nanstd(X_vals[~mask_cls, :], axis=0)
+                reference_label = "Other classes"
         else:
             pass_avg = np.nanmean(X_vals[~mask_cls, :], axis=0)
             pass_std = np.nanstd(X_vals[~mask_cls, :], axis=0)
+            other_labels = [str(c) for c in class_names if str(c) != cls_str]
+            reference_label = (
+                other_labels[0]
+                if len(other_labels) == 1
+                else "Other classes"
+            )
 
         total = float(np.nansum(imp)) if np.nansum(imp) != 0 else 1.0
         share_pct = (imp / total) * 100.0
@@ -246,6 +277,7 @@ def _build_per_class_importance_tables(
                     "failure_avg": failure_avg,
                     "pass_avg": pass_avg,
                     "pass_std": pass_std,
+                    "reference_label": reference_label,
                 }
             )
             .sort_values("importance", ascending=False)
@@ -419,11 +451,9 @@ def _build_visual_plot_payload(
             group_candidates = _select_distribution_groups(y_upper, max_groups=2)
 
             pass_idx = None
-            for i, cls in enumerate(labels):
-                cu = cls.upper().strip()
-                if cu == "PASS" or "PASS" in cu:
-                    pass_idx = i
-                    break
+            pass_label = _infer_pass_reference_label(labels)
+            if pass_label in class_to_idx:
+                pass_idx = class_to_idx[pass_label]
 
             pf_labels = np.where(pass_mask, "PASS", "FAIL")
 

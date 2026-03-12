@@ -983,6 +983,10 @@ class DashboardTabs(QtWidgets.QTabWidget):
             if not (isinstance(df_cls, pd.DataFrame) and not df_cls.empty):
                 continue
 
+            reference_label = str(df_cls.get("reference_label", pd.Series(["Other classes"])).iloc[0]).strip()
+            if not reference_label:
+                reference_label = "Other classes"
+
             group = QtWidgets.QGroupBox(f"{cls_name} - Top 20 Features")
             vbox = QtWidgets.QVBoxLayout(group)
 
@@ -997,8 +1001,8 @@ class DashboardTabs(QtWidgets.QTabWidget):
                     "Share (%)",
                     "Direction",
                     "Failure Avg",
-                    "PASS/Other Avg",
-                    "PASS/Other Std",
+                    f"{reference_label} Avg",
+                    f"{reference_label} Std",
                 ]
             )
             table.verticalHeader().setVisible(False)
